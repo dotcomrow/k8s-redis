@@ -112,25 +112,28 @@ spec:
             VAULT_TOKEN="$(echo -n "$TOK_B64" | base64 -d)"
 
             echo "⏳ Waiting for Vault at ${VAULT_ADDR}…"
-            for i in $(seq 1 120); do
-              if curl -sf -H "X-Vault-Token: ${VAULT_TOKEN}" "${VAULT_ADDR}/v1/sys/health" >/dev/null; then
-                break
-              fi
+            i=0
+            until curl -sf -H "X-Vault-Token: ${VAULT_TOKEN}" "${VAULT_ADDR}/v1/sys/health" >/dev/null; do
+              i=$((i+1)); [ "$i" -gt 120 ] && { echo "❌ Vault not healthy after 240s"; exit 1; }
               sleep 2
             done
             echo "✅ Vault reachable. Bootstrapping kv/redis, policy, and k8s role…"
 
+            # POSIX-friendly helper (no arrays)
             VAULT_API() {
-              local METHOD="$1"; shift
-              local PATH="$1"; shift
-              local BODYFILE="${1:-}"
-              local HDR_CT=()
-              [ -n "$BODYFILE" ] && HDR_CT=(-H "Content-Type: application/json")
+              METHOD="$1"; PATH="$2"; BODYFILE="${3:-}";
 
-              HTTP=$(curl -sS -o /tmp/resp.txt -w '%{http_code}' \
-                -H "X-Vault-Token: ${VAULT_TOKEN}" "${HDR_CT[@]}" \
-                -X "$METHOD" ${BODYFILE:+--data-binary @"$BODYFILE"} \
-                "${VAULT_ADDR}/v1/${PATH}" || true)
+              if [ -n "$BODYFILE" ]; then
+                HTTP="$(curl -sS -o /tmp/resp.txt -w '%{http_code}' \
+                  -H "X-Vault-Token: ${VAULT_TOKEN}" -H "Content-Type: application/json" \
+                  -X "$METHOD" --data-binary @"$BODYFILE" \
+                  "${VAULT_ADDR}/v1/${PATH}" || true)"
+              else
+                HTTP="$(curl -sS -o /tmp/resp.txt -w '%{http_code}' \
+                  -H "X-Vault-Token: ${VAULT_TOKEN}" \
+                  -X "$METHOD" "${VAULT_ADDR}/v1/${PATH}" || true)"
+              fi
+
               if [ "$HTTP" -lt 200 ] || [ "$HTTP" -ge 400 ]; then
                 echo "❌ ${METHOD} /v1/${PATH} -> HTTP ${HTTP}"
                 echo "── Response:"; sed 's/^/   /' /tmp/resp.txt
@@ -141,15 +144,16 @@ spec:
 
             # 1) Ensure KV v2 at 'kv/'
             MOUNTS_JSON="$(VAULT_API GET sys/mounts)"
-            if ! echo "$MOUNTS_JSON" | grep -q '"kv/":{'; then
+            echo "$MOUNTS_JSON" | grep -q '"kv/":{' || {
               echo "ℹ️ Enabling KV mount at 'kv/' (v2)"
               printf '{"type":"kv","options":{"version":"2"}}' > /tmp/kv-enable.json
               VAULT_API POST sys/mounts/kv /tmp/kv-enable.json >/dev/null
-            else
-              if ! echo "$MOUNTS_JSON" | grep -q '"kv/".*"options":{"version":"2"'; then
-                echo "❌ 'kv/' mount exists but is not version 2."; exit 1
-              fi
-            fi
+            }
+            echo "$MOUNTS_JSON" | grep -q '"kv/".*"options":{"version":"2"' || {
+              # re-fetch to be sure after enable
+              MOUNTS_JSON="$(VAULT_API GET sys/mounts)"
+              echo "$MOUNTS_JSON" | grep -q '"kv/".*"options":{"version":"2"' || { echo "❌ 'kv/' is not KV v2"; exit 1; }
+            }
 
             # 2) Create kv/redis if missing
             if ! curl -sf -H "X-Vault-Token: ${VAULT_TOKEN}" "${VAULT_ADDR}/v1/kv/data/redis" >/dev/null; then
@@ -163,12 +167,12 @@ spec:
 
             # 3) Ensure kubernetes auth is enabled
             AUTHS_JSON="$(VAULT_API GET sys/auth)"
-            if ! echo "$AUTHS_JSON" | grep -q '"kubernetes/":{"type":"kubernetes"'; then
+            echo "$AUTHS_JSON" | grep -q '"kubernetes/":{"type":"kubernetes"' || {
               echo "ℹ️ Enabling kubernetes auth at 'auth/kubernetes'"
               printf '{"type":"kubernetes"}' > /tmp/auth-enable.json
               VAULT_API POST sys/auth/kubernetes /tmp/auth-enable.json >/dev/null
               echo "   (Ensure auth/kubernetes/config is set separately.)"
-            fi
+            }
 
             # 4) Upsert policy
             printf 'path "kv/data/redis" { capabilities = ["read"] }\n' > /tmp/redis-policy.hcl
