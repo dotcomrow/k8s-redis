@@ -10,6 +10,148 @@ metadata:
     field.cattle.io/projectId: local:infrastructure
 ---
 apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: redis-vault-bootstrap
+  namespace: redis
+---
+# In the vault ns: allow reading just the 'vault-root-token' Secret
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: read-vault-root-token
+  namespace: vault
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames: ["vault-root-token"]   # tighten to the exact Secret name you use
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: allow-redis-bootstrap-to-read-root-token
+  namespace: vault
+subjects:
+- kind: ServiceAccount
+  name: redis-vault-bootstrap
+  namespace: redis
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: read-vault-root-token
+---
+# In the redis ns: allow creating/updating Secrets (only if you want to write any there)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: secret-writer
+  namespace: redis
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get","create","update","patch","list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: allow-redis-bootstrap-secret-write
+  namespace: redis
+subjects:
+- kind: ServiceAccount
+  name: redis-vault-bootstrap
+  namespace: redis
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: secret-writer
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: redis-vault-bootstrap
+  namespace: redis
+spec:
+  backoffLimit: 6
+  template:
+    metadata:
+      annotations:
+        linkerd.io/inject: disabled
+    spec:
+      serviceAccountName: redis-vault-bootstrap
+      restartPolicy: OnFailure
+      ttlSecondsAfterFinished: 1800
+      containers:
+      - name: bootstrap
+        # has both kubectl and sh; small & boring
+        image: alpine/k8s:1.31.4
+        env:
+          - name: VAULT_ADDR
+            value: "http://vault.vault.svc.cluster.local:8200"   # <-- set to your Vault service URL
+        command: ["/bin/sh","-lc"]
+        args:
+          - |
+            set -euo pipefail
+
+            echo "🔐 Fetching Vault root/admin token from vault namespace…"
+            # Try common key names: token, root-token, root_token
+            TOK_B64=""
+            for k in token root-token root_token; do
+              if OUT=$(kubectl -n vault get secret vault-root-token -o jsonpath="{.data.${k}}" 2>/dev/null) && [ -n "$OUT" ]; then
+                TOK_B64="$OUT"; break
+              fi
+            done
+            if [ -z "${TOK_B64}" ]; then
+              echo "❌ Could not locate token key in Secret 'vault-root-token' (tried: token, root-token, root_token)."
+              echo "Keys present: $(kubectl -n vault get secret vault-root-token -o jsonpath='{.data}' || true)"
+              exit 1
+            fi
+            VAULT_TOKEN="$(echo -n "$TOK_B64" | base64 -d)"
+
+            echo "⏳ Waiting for Vault at ${VAULT_ADDR}…"
+            for i in $(seq 1 120); do
+              if VAULT_TOKEN="$VAULT_TOKEN" wget -qO- "${VAULT_ADDR}/v1/sys/health" >/dev/null 2>&1; then
+                break
+              fi
+              sleep 2
+            done
+
+            echo "✅ Vault reachable. Bootstrapping kv/redis secret, policy, and k8s role…"
+            cat > /tmp/redis-policy.hcl <<'HCL'
+            path "kv/data/redis" {
+              capabilities = ["read"]
+            }
+            HCL
+
+            # Create password if kv/redis absent
+            if ! VAULT_TOKEN="$VAULT_TOKEN" wget -qO- "${VAULT_ADDR}/v1/kv/data/redis" >/dev/null 2>&1; then
+              PW="$(head -c 32 /dev/urandom | base64)"
+              cat > /tmp/kv.json <<JSON
+              {"data":{"password":"${PW}"}}
+              JSON
+              VAULT_TOKEN="$VAULT_TOKEN" wget -qO- --method=POST --header="X-Vault-Token: ${VAULT_TOKEN}" --header="Content-Type: application/json" --body-file=/tmp/kv.json "${VAULT_ADDR}/v1/kv/data/redis" >/dev/null
+              echo "🔑 Created kv/redis with generated password."
+            else
+              echo "🔑 kv/redis already exists; leaving password unchanged."
+            fi
+
+            # Write/overwrite policy
+            VAULT_TOKEN="$VAULT_TOKEN" wget -qO- --method=PUT --header="X-Vault-Token: ${VAULT_TOKEN}" --header="Content-Type: text/plain" --body-file=/tmp/redis-policy.hcl "${VAULT_ADDR}/v1/sys/policies/acl/redis-policy" >/dev/null
+
+            # Create/Update k8s role binding SA 'redis' in ns 'redis'
+            cat > /tmp/role.json <<JSON
+            {
+              "bound_service_account_names": ["redis"],
+              "bound_service_account_namespaces": ["redis"],
+              "policies": ["redis-policy"],
+              "ttl": "24h"
+            }
+            JSON
+            VAULT_TOKEN="$VAULT_TOKEN" wget -qO- --method=POST --header="X-Vault-Token: ${VAULT_TOKEN}" --header="Content-Type: application/json" --body-file=/tmp/role.json "${VAULT_ADDR}/v1/auth/kubernetes/role/redis-role" >/dev/null
+
+            echo "🎉 Vault bootstrap complete."   # <-- token with perms to write policy/role & kv
+---
+apiVersion: v1
 kind: Secret
 metadata:
   name: redis-auth
@@ -110,6 +252,15 @@ spec:
   template:
     metadata:
       labels: { app: redis }
+      annotations:
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/role: "redis-role"
+        # KV v2 path; adjust if your mount path differs
+        vault.hashicorp.com/agent-inject-secret-password: "kv/data/redis"
+        vault.hashicorp.com/agent-inject-template-password: |
+          {{- with secret "kv/data/redis" -}}
+          {{ .Data.data.password }}
+          {{- end }}
     spec:
       terminationGracePeriodSeconds: 30
       # Only schedule on work/srvr nodes; avoid ctrl/etcd without new labels
@@ -139,47 +290,31 @@ spec:
         - name: redis
           image: redis:7.2-alpine
           imagePullPolicy: IfNotPresent
-          env:
-            - name: REDIS_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: redis-auth
-                  key: password
           ports:
             - { containerPort: 6379, name: redis }
           volumeMounts:
             - { name: data, mountPath: /data }
             - { name: cfg-ro, mountPath: /config }   # read-only source
             - { name: cfg-rw, mountPath: /etc/redis } # writable target
-          command:
-            - /bin/sh
-            - -lc
-            - |
+          command: ["/bin/sh","-lc","
               set -e
+              REDIS_PASSWORD=$(cat /vault/secrets/password)
               cp /config/redis.conf /etc/redis/redis.conf
-              # Inject auth
-              echo "requirepass ${REDIS_PASSWORD}" >> /etc/redis/redis.conf
-              echo "masterauth ${REDIS_PASSWORD}" >> /etc/redis/redis.conf
-
-              # Initial role: pod-0 primary, others replicas of pod-0
-              case "$(hostname)" in
-                *-0) echo "Starting as initial primary" ;;
-                *)    echo "replicaof redis-0.redis-headless.redis.svc.cluster.local 6379" >> /etc/redis/redis.conf ;;
-              esac
-
-              # Graceful shutdown on SIGTERM
-              trap 'redis-cli -a "$REDIS_PASSWORD" shutdown nosave || true' TERM INT
+              echo \"requirepass ${REDIS_PASSWORD}\" >> /etc/redis/redis.conf
+              echo \"masterauth ${REDIS_PASSWORD}\" >> /etc/redis/redis.conf
+              case \"$(hostname)\" in *-0) ;; *) echo 'replicaof redis-0.redis-headless.redis.svc.cluster.local 6379' >> /etc/redis/redis.conf ;; esac
+              trap 'redis-cli -a \"$(cat /vault/secrets/password)\" shutdown nosave || true' TERM INT
               exec redis-server /etc/redis/redis.conf
+            "]
           readinessProbe:
-            exec:
-              command: ["/bin/sh","-lc","redis-cli -a \"$REDIS_PASSWORD\" ping"]
+            exec: { command: ["/bin/sh","-lc","redis-cli -a \"$(cat /vault/secrets/password)\" ping"] }
             initialDelaySeconds: 5
             periodSeconds: 5
           livenessProbe:
-            exec:
-              command: ["/bin/sh","-lc","redis-cli -a \"$REDIS_PASSWORD\" ping"]
+            exec: { command: ["/bin/sh","-lc","redis-cli -a \"$(cat /vault/secrets/password)\" ping"] }
             initialDelaySeconds: 15
             periodSeconds: 10
+
           resources:
             requests: { cpu: "100m", memory: "128Mi" }
             limits: { memory: "512Mi" }
@@ -187,36 +322,26 @@ spec:
         - name: sentinel
           image: redis:7.2-alpine
           imagePullPolicy: IfNotPresent
-          env:
-            - name: REDIS_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: redis-auth
-                  key: password
           ports:
             - { containerPort: 26379, name: sentinel }
           volumeMounts:
             - { name: cfg-ro, mountPath: /config }   # read-only source
             - { name: cfg-rw, mountPath: /etc/redis } # writable target
-          command:
-            - /bin/sh
-            - -lc
-            - |
+          command: ["/bin/sh","-lc","
               set -e
               cp /config/sentinel.conf /etc/redis/sentinel.conf
-              # Inject auth so sentinel can talk to primary
-              echo "sentinel auth-pass mymaster ${REDIS_PASSWORD}" >> /etc/redis/sentinel.conf
+              echo \"sentinel auth-pass mymaster $(cat /vault/secrets/password)\" >> /etc/redis/sentinel.conf
               exec redis-sentinel /etc/redis/sentinel.conf
+            "]
           readinessProbe:
-            exec:
-              command: ["/bin/sh","-lc","redis-cli -a \"$REDIS_PASSWORD\" -p 26379 ping"]
+            exec: { command: ["/bin/sh","-lc","redis-cli -a \"$(cat /vault/secrets/password)\" -p 26379 ping"] }
             initialDelaySeconds: 5
             periodSeconds: 5
           livenessProbe:
-            exec:
-              command: ["/bin/sh","-lc","redis-cli -a \"$REDIS_PASSWORD\" -p 26379 ping"]
+            exec: { command: ["/bin/sh","-lc","redis-cli -a \"$(cat /vault/secrets/password)\" -p 26379 ping"] }
             initialDelaySeconds: 15
             periodSeconds: 10
+
           resources:
             requests: { cpu: "50m", memory: "64Mi" }
             limits: { memory: "256Mi" }
