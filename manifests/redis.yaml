@@ -30,10 +30,11 @@ data:
     bind 0.0.0.0
     protected-mode no
     appendonly yes
-    save ""                    # RDB off by default; add "save 900 1" if you want snapshots
+    # RDB off by default; add 'save 900 1' if you want snapshots
+    save ""
     tcp-keepalive 300
     timeout 0
-    # Auth is injected at runtime via entrypoint:
+    # Auth is injected at runtime via command args:
     #   requirepass <password>
     #   masterauth <password>
 
@@ -42,14 +43,11 @@ data:
     bind 0.0.0.0
     protected-mode no
     daemonize no
-    # Monitor the master name "mymaster" (initially redis-0)
     sentinel monitor mymaster redis-0.redis-headless.redis.svc.cluster.local 6379 2
     sentinel down-after-milliseconds mymaster 5000
     sentinel parallel-syncs mymaster 1
     sentinel failover-timeout mymaster 60000
     sentinel resolve-hostnames yes
-    # Auth injected by entrypoint:
-    #   sentinel auth-pass mymaster <password>
 
 ---
 apiVersion: v1
