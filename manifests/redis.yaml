@@ -96,59 +96,68 @@ spec:
             echo "🔐 Fetching Vault root/admin token from vault namespace…"
             TOK_B64=""
             for k in VAULT_TOKEN token root-token root_token; do
-              if OUT=$(kubectl -n vault get secret vault-root-token -o jsonpath="{.data.${k}}" 2>/dev/null) && [ -n "$OUT" ]; then
-                TOK_B64="$OUT"; break
-              fi
+              OUT="$(kubectl -n vault get secret vault-root-token -o jsonpath="{.data.${k}}" 2>/dev/null || true)"
+              if [ -n "${OUT}" ]; then TOK_B64="${OUT}"; break; fi
             done
             if [ -z "${TOK_B64}" ]; then
               echo "❌ Could not locate token key in Secret 'vault-root-token' (tried: VAULT_TOKEN, token, root-token, root_token)."
-              echo "Keys present: $(kubectl -n vault get secret vault-root-token -o jsonpath='{.data}' || true)"
+              echo "Keys present: $(kubectl -n vault get secret vault-root-token -o jsonpath='{.data}' 2>/dev/null || true)"
               exit 1
             fi
             VAULT_TOKEN="$(echo -n "$TOK_B64" | base64 -d)"
 
             echo "⏳ Waiting for Vault at ${VAULT_ADDR}…"
             for i in $(seq 1 120); do
-              if VAULT_TOKEN="$VAULT_TOKEN" wget -qO- "${VAULT_ADDR}/v1/sys/health" >/dev/null 2>&1; then
+              if curl -sf -H "X-Vault-Token: ${VAULT_TOKEN}" "${VAULT_ADDR}/v1/sys/health" >/dev/null; then
                 break
               fi
               sleep 2
             done
 
-            echo "✅ Vault reachable. Bootstrapping kv/redis secret, policy, and k8s role…"
-            cat > /tmp/redis-policy.hcl <<'HCL'
-            path "kv/data/redis" {
-              capabilities = ["read"]
-            }
-            HCL
+            echo "✅ Vault reachable. Bootstrapping kv/redis, policy, and k8s role…"
 
-            # Create password if kv/redis absent
-            if ! VAULT_TOKEN="$VAULT_TOKEN" wget -qO- "${VAULT_ADDR}/v1/kv/data/redis" >/dev/null 2>&1; then
-              PW="$(head -c 32 /dev/urandom | base64)"
-              cat > /tmp/kv.json <<JSON
-              {"data":{"password":"${PW}"}}
-              JSON
-              VAULT_TOKEN="$VAULT_TOKEN" wget -qO- --method=POST --header="X-Vault-Token: ${VAULT_TOKEN}" --header="Content-Type: application/json" --body-file=/tmp/kv.json "${VAULT_ADDR}/v1/kv/data/redis" >/dev/null
+            # Write policy file without heredocs
+            printf '%s\n' \
+              'path "kv/data/redis" {' \
+              '  capabilities = ["read"]' \
+              '}' \
+              > /tmp/redis-policy.hcl
+
+            # Create kv/redis if it doesn't exist (KV v2)
+            if ! curl -sf -H "X-Vault-Token: ${VAULT_TOKEN}" "${VAULT_ADDR}/v1/kv/data/redis" >/dev/null; then
+              PW="$(head -c 32 /dev/urandom | base64 | tr -d '\n=')"
+              printf '%s\n' \
+                '{' \
+                '  "data": {' \
+                '    "password": "'"${PW}"'"' \
+                '  }' \
+                '}' > /tmp/kv.json
+              curl -sf -H "X-Vault-Token: ${VAULT_TOKEN}" -H "Content-Type: application/json" \
+                -X POST --data-binary @/tmp/kv.json \
+                "${VAULT_ADDR}/v1/kv/data/redis" >/dev/null
               echo "🔑 Created kv/redis with generated password."
             else
               echo "🔑 kv/redis already exists; leaving password unchanged."
             fi
 
-            # Write/overwrite policy
-            VAULT_TOKEN="$VAULT_TOKEN" wget -qO- --method=PUT --header="X-Vault-Token: ${VAULT_TOKEN}" --header="Content-Type: text/plain" --body-file=/tmp/redis-policy.hcl "${VAULT_ADDR}/v1/sys/policies/acl/redis-policy" >/dev/null
+            # Upsert policy
+            curl -sf -H "X-Vault-Token: ${VAULT_TOKEN}" -H "Content-Type: text/plain" \
+              -X PUT --data-binary @/tmp/redis-policy.hcl \
+              "${VAULT_ADDR}/v1/sys/policies/acl/redis-policy" >/dev/null
 
-            # Create/Update k8s role binding SA 'redis' in ns 'redis'
-            cat > /tmp/role.json <<JSON
-            {
-              "bound_service_account_names": ["redis"],
-              "bound_service_account_namespaces": ["redis"],
-              "policies": ["redis-policy"],
-              "ttl": "24h"
-            }
-            JSON
-            VAULT_TOKEN="$VAULT_TOKEN" wget -qO- --method=POST --header="X-Vault-Token: ${VAULT_TOKEN}" --header="Content-Type: application/json" --body-file=/tmp/role.json "${VAULT_ADDR}/v1/auth/kubernetes/role/redis-role" >/dev/null
+            # Upsert Kubernetes auth role
+            printf '%s\n' \
+              '{' \
+              '  "bound_service_account_names": ["redis"],' \
+              '  "bound_service_account_namespaces": ["redis"],' \
+              '  "policies": ["redis-policy"],' \
+              '  "ttl": "24h"' \
+              '}' > /tmp/role.json
+            curl -sf -H "X-Vault-Token: ${VAULT_TOKEN}" -H "Content-Type: application/json" \
+              -X POST --data-binary @/tmp/role.json \
+              "${VAULT_ADDR}/v1/auth/kubernetes/role/redis-role" >/dev/null
 
-            echo "🎉 Vault bootstrap complete."   # <-- token with perms to write policy/role & kv
+            echo "🎉 Vault bootstrap complete."
 ---
 apiVersion: v1
 kind: Secret
