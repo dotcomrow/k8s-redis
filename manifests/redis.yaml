@@ -3,6 +3,11 @@ apiVersion: v1
 kind: Namespace
 metadata:
   name: redis
+  labels:
+    app: redis
+  annotations:
+    linkerd.io/inject: disabled
+    field.cattle.io/projectId: local:infrastructure
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -15,54 +20,52 @@ data:
     bind 0.0.0.0
     protected-mode no
     appendonly yes
-    # Let Sentinel reconfigure replication; replicas start as replicaof pod-0
-    # Disable cluster mode for this Sentinel-based HA setup
-    save ""
+    save ""                    # RDB off by default; add "save 900 1" if you want snapshots
     tcp-keepalive 300
     timeout 0
+    # Auth is injected at runtime via command args:
+    #   requirepass <password>
+    #   masterauth <password>
+
   sentinel.conf: |
     port 26379
     bind 0.0.0.0
     protected-mode no
     daemonize no
-    # Monitor the master name "mymaster" (initially redis-0:6379), quorum 2
+    # Monitor the master name "mymaster" (initially redis-0)
     sentinel monitor mymaster redis-0.redis-headless.redis.svc.cluster.local 6379 2
     sentinel down-after-milliseconds mymaster 5000
     sentinel parallel-syncs mymaster 1
     sentinel failover-timeout mymaster 60000
-    # Announce DNS names to avoid IP changes; sentinel resolves them
-    # (Optional tuning)
     sentinel resolve-hostnames yes
+    # Auth for talking to Redis primary (value injected via env)
+    # sentinel auth-pass mymaster <password>
+
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: redis
   namespace: redis
-  labels:
-    app: redis
+  labels: { app: redis }
 spec:
-  # Cluster-wide virtual IP your apps can use for plain Redis connections
-  # (connect to the master via Sentinel-aware client)
   type: ClusterIP
-  selector:
-    app: redis
+  selector: { app: redis }
   ports:
     - name: redis
       port: 6379
       targetPort: 6379
+
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: redis-sentinel
   namespace: redis
-  labels:
-    app: redis
+  labels: { app: redis }
 spec:
   type: ClusterIP
-  selector:
-    app: redis
+  selector: { app: redis }
   ports:
     - name: sentinel
       port: 26379
@@ -73,13 +76,11 @@ kind: Service
 metadata:
   name: redis-headless
   namespace: redis
-  labels:
-    app: redis
+  labels: { app: redis }
 spec:
   clusterIP: None
   publishNotReadyAddresses: true
-  selector:
-    app: redis
+  selector: { app: redis }
   ports:
     - name: redis
       port: 6379
@@ -98,100 +99,126 @@ spec:
   replicas: 3
   podManagementPolicy: Parallel
   selector:
-    matchLabels:
-      app: redis
+    matchLabels: { app: redis }
   template:
     metadata:
-      labels:
-        app: redis
+      labels: { app: redis }
     spec:
+      # Avoid ctrl/etcd nodes; spread across others
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - { key: node-role.kubernetes.io/control-plane, operator: DoesNotExist }
+              - { key: node-role.kubernetes.io/master, operator: DoesNotExist }
+              - { key: node-role.kubernetes.io/etcd, operator: DoesNotExist }
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels: { app: redis }
+            topologyKey: kubernetes.io/hostname
+      tolerations: [] # don’t tolerate control-plane/etcd taints
       securityContext:
         fsGroup: 1001
       containers:
         - name: redis
           image: redis:7.2-alpine
           imagePullPolicy: IfNotPresent
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: redis-auth
+                  key: password
           command:
             - /bin/sh
             - -c
             - |
               set -e
-              # Decide initial role: pod-0 is master; others start as replicas of pod-0
+              cp /etc/redis/base/redis.conf /etc/redis/redis.conf
+              # Inject auth
+              echo "requirepass ${REDIS_PASSWORD}" >> /etc/redis/redis.conf
+              echo "masterauth ${REDIS_PASSWORD}" >> /etc/redis/redis.conf
+
               HOSTNAME="$(hostname)"
               if echo "$HOSTNAME" | grep -q -- '-0$'; then
                 echo "Starting as initial primary"
-                exec redis-server /etc/redis/redis.conf
               else
-                echo "Starting as initial replica of redis-0"
                 echo "replicaof redis-0.redis-headless.redis.svc.cluster.local 6379" >> /etc/redis/redis.conf
-                exec redis-server /etc/redis/redis.conf
               fi
+              exec redis-server /etc/redis/redis.conf
           ports:
-            - containerPort: 6379
-              name: redis
+            - { containerPort: 6379, name: redis }
           readinessProbe:
-            exec:
-              command: ["redis-cli","ping"]
+            exec: { command: ["redis-cli","-a","$(REDIS_PASSWORD)","ping"] }
             initialDelaySeconds: 5
             periodSeconds: 5
           livenessProbe:
-            exec:
-              command: ["redis-cli","ping"]
+            exec: { command: ["redis-cli","-a","$(REDIS_PASSWORD)","ping"] }
             initialDelaySeconds: 15
             periodSeconds: 10
           resources:
-            requests:
-              cpu: "100m"
-              memory: "128Mi"
-            limits:
-              memory: "512Mi"
+            requests: { cpu: "100m", memory: "128Mi" }
+            limits: { memory: "512Mi" }
           volumeMounts:
-            - name: data
-              mountPath: /data
-            - name: config
-              mountPath: /etc/redis
+            - { name: data, mountPath: /data }
+            - { name: config, mountPath: /etc/redis/base }
+
         - name: sentinel
           image: redis:7.2-alpine
           imagePullPolicy: IfNotPresent
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: redis-auth
+                  key: password
           command:
-            - redis-sentinel
-            - /etc/redis/sentinel.conf
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              cp /etc/redis/base/sentinel.conf /etc/redis/sentinel.conf
+              # Inject auth so sentinel can talk to primary
+              echo "sentinel auth-pass mymaster ${REDIS_PASSWORD}" >> /etc/redis/sentinel.conf
+              exec redis-sentinel /etc/redis/sentinel.conf
           ports:
-            - containerPort: 26379
-              name: sentinel
+            - { containerPort: 26379, name: sentinel }
           readinessProbe:
-            exec:
-              command: ["redis-cli","-p","26379","ping"]
+            exec: { command: ["redis-cli","-a","$(REDIS_PASSWORD)","-p","26379","ping"] }
             initialDelaySeconds: 5
             periodSeconds: 5
           livenessProbe:
-            exec:
-              command: ["redis-cli","-p","26379","ping"]
+            exec: { command: ["redis-cli","-a","$(REDIS_PASSWORD)","-p","26379","ping"] }
             initialDelaySeconds: 15
             periodSeconds: 10
           resources:
-            requests:
-              cpu: "50m"
-              memory: "64Mi"
-            limits:
-              memory: "256Mi"
+            requests: { cpu: "50m", memory: "64Mi" }
+            limits: { memory: "256Mi" }
           volumeMounts:
-            - name: config
-              mountPath: /etc/redis
+            - { name: config, mountPath: /etc/redis/base }
+
       volumes:
         - name: config
           configMap:
             name: redis-config
             items:
-              - key: redis.conf
-                path: redis.conf
-              - key: sentinel.conf
-                path: sentinel.conf
+              - { key: redis.conf, path: redis.conf }
+              - { key: sentinel.conf, path: sentinel.conf }
   volumeClaimTemplates:
-    - metadata:
-        name: data
+    - metadata: { name: data }
       spec:
         accessModes: ["ReadWriteOnce"]
-        resources:
-          requests:
-            storage: 5Gi
+        resources: { requests: { storage: 5Gi } }
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: redis-pdb
+  namespace: redis
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels: { app: redis }
