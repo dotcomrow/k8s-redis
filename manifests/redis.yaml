@@ -10,6 +10,16 @@ metadata:
     field.cattle.io/projectId: local:infrastructure
 ---
 apiVersion: v1
+kind: Secret
+metadata:
+  name: redis-auth
+  namespace: redis
+type: Opaque
+data:
+  # change this later: echo -n 'changeMeNow!' | base64
+  password: Y2hhbmdlTWVOb3ch
+---
+apiVersion: v1
 kind: ConfigMap
 metadata:
   name: redis-config
@@ -23,7 +33,7 @@ data:
     save ""                    # RDB off by default; add "save 900 1" if you want snapshots
     tcp-keepalive 300
     timeout 0
-    # Auth is injected at runtime via command args:
+    # Auth is injected at runtime via entrypoint:
     #   requirepass <password>
     #   masterauth <password>
 
@@ -38,8 +48,8 @@ data:
     sentinel parallel-syncs mymaster 1
     sentinel failover-timeout mymaster 60000
     sentinel resolve-hostnames yes
-    # Auth for talking to Redis primary (value injected via env)
-    # sentinel auth-pass mymaster <password>
+    # Auth injected by entrypoint:
+    #   sentinel auth-pass mymaster <password>
 
 ---
 apiVersion: v1
@@ -55,7 +65,6 @@ spec:
     - name: redis
       port: 6379
       targetPort: 6379
-
 ---
 apiVersion: v1
 kind: Service
@@ -104,15 +113,16 @@ spec:
     metadata:
       labels: { app: redis }
     spec:
-      # Avoid ctrl/etcd nodes; spread across others
+      terminationGracePeriodSeconds: 30
+      # Only schedule on work/srvr nodes; avoid ctrl/etcd without new labels
       affinity:
         nodeAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
             nodeSelectorTerms:
             - matchExpressions:
-              - { key: node-role.kubernetes.io/control-plane, operator: DoesNotExist }
-              - { key: node-role.kubernetes.io/master, operator: DoesNotExist }
-              - { key: node-role.kubernetes.io/etcd, operator: DoesNotExist }
+              - key: dedicated
+                operator: In
+                values: ["work-node", "srvr-node"]
         podAntiAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
           - labelSelector:
@@ -121,6 +131,12 @@ spec:
       tolerations: [] # don’t tolerate control-plane/etcd taints
       securityContext:
         fsGroup: 1001
+      volumes:
+        - name: cfg-ro
+          configMap:
+            name: redis-config
+        - name: cfg-rw
+          emptyDir: {}
       containers:
         - name: redis
           image: redis:7.2-alpine
@@ -131,39 +147,44 @@ spec:
                 secretKeyRef:
                   name: redis-auth
                   key: password
+          ports:
+            - { containerPort: 6379, name: redis }
+          volumeMounts:
+            - { name: data, mountPath: /data }
+            - { name: cfg-ro, mountPath: /config }   # read-only source
+            - { name: cfg-rw, mountPath: /etc/redis } # writable target
           command:
             - /bin/sh
-            - -c
+            - -lc
             - |
               set -e
-              cp /etc/redis/base/redis.conf /etc/redis/redis.conf
+              cp /config/redis.conf /etc/redis/redis.conf
               # Inject auth
               echo "requirepass ${REDIS_PASSWORD}" >> /etc/redis/redis.conf
               echo "masterauth ${REDIS_PASSWORD}" >> /etc/redis/redis.conf
 
-              HOSTNAME="$(hostname)"
-              if echo "$HOSTNAME" | grep -q -- '-0$'; then
-                echo "Starting as initial primary"
-              else
-                echo "replicaof redis-0.redis-headless.redis.svc.cluster.local 6379" >> /etc/redis/redis.conf
-              fi
+              # Initial role: pod-0 primary, others replicas of pod-0
+              case "$(hostname)" in
+                *-0) echo "Starting as initial primary" ;;
+                *)    echo "replicaof redis-0.redis-headless.redis.svc.cluster.local 6379" >> /etc/redis/redis.conf ;;
+              esac
+
+              # Graceful shutdown on SIGTERM
+              trap 'redis-cli -a "$REDIS_PASSWORD" shutdown nosave || true' TERM INT
               exec redis-server /etc/redis/redis.conf
-          ports:
-            - { containerPort: 6379, name: redis }
           readinessProbe:
-            exec: { command: ["redis-cli","-a","$(REDIS_PASSWORD)","ping"] }
+            exec:
+              command: ["/bin/sh","-lc","redis-cli -a \"$REDIS_PASSWORD\" ping"]
             initialDelaySeconds: 5
             periodSeconds: 5
           livenessProbe:
-            exec: { command: ["redis-cli","-a","$(REDIS_PASSWORD)","ping"] }
+            exec:
+              command: ["/bin/sh","-lc","redis-cli -a \"$REDIS_PASSWORD\" ping"]
             initialDelaySeconds: 15
             periodSeconds: 10
           resources:
             requests: { cpu: "100m", memory: "128Mi" }
             limits: { memory: "512Mi" }
-          volumeMounts:
-            - { name: data, mountPath: /data }
-            - { name: config, mountPath: /etc/redis/base }
 
         - name: sentinel
           image: redis:7.2-alpine
@@ -174,44 +195,38 @@ spec:
                 secretKeyRef:
                   name: redis-auth
                   key: password
+          ports:
+            - { containerPort: 26379, name: sentinel }
+          volumeMounts:
+            - { name: cfg-ro, mountPath: /config }   # read-only source
+            - { name: cfg-rw, mountPath: /etc/redis } # writable target
           command:
             - /bin/sh
-            - -c
+            - -lc
             - |
               set -e
-              cp /etc/redis/base/sentinel.conf /etc/redis/sentinel.conf
+              cp /config/sentinel.conf /etc/redis/sentinel.conf
               # Inject auth so sentinel can talk to primary
               echo "sentinel auth-pass mymaster ${REDIS_PASSWORD}" >> /etc/redis/sentinel.conf
               exec redis-sentinel /etc/redis/sentinel.conf
-          ports:
-            - { containerPort: 26379, name: sentinel }
           readinessProbe:
-            exec: { command: ["redis-cli","-a","$(REDIS_PASSWORD)","-p","26379","ping"] }
+            exec:
+              command: ["/bin/sh","-lc","redis-cli -a \"$REDIS_PASSWORD\" -p 26379 ping"]
             initialDelaySeconds: 5
             periodSeconds: 5
           livenessProbe:
-            exec: { command: ["redis-cli","-a","$(REDIS_PASSWORD)","-p","26379","ping"] }
+            exec:
+              command: ["/bin/sh","-lc","redis-cli -a \"$REDIS_PASSWORD\" -p 26379 ping"]
             initialDelaySeconds: 15
             periodSeconds: 10
           resources:
             requests: { cpu: "50m", memory: "64Mi" }
             limits: { memory: "256Mi" }
-          volumeMounts:
-            - { name: config, mountPath: /etc/redis/base }
-
-      volumes:
-        - name: config
-          configMap:
-            name: redis-config
-            items:
-              - { key: redis.conf, path: redis.conf }
-              - { key: sentinel.conf, path: sentinel.conf }
   volumeClaimTemplates:
     - metadata: { name: data }
       spec:
         accessModes: ["ReadWriteOnce"]
         resources: { requests: { storage: 5Gi } }
-
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget
