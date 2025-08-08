@@ -103,7 +103,7 @@ metadata:
   namespace: redis
 spec:
   serviceName: redis-headless
-  replicas: 3
+  replicas: 2
   podManagementPolicy: Parallel
   selector:
     matchLabels: { app: redis }
