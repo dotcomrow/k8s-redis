@@ -94,15 +94,14 @@ spec:
             set -euo pipefail
 
             echo "🔐 Fetching Vault root/admin token from vault namespace…"
-            # Try common key names: token, root-token, root_token
             TOK_B64=""
-            for k in token root-token root_token; do
+            for k in VAULT_TOKEN token root-token root_token; do
               if OUT=$(kubectl -n vault get secret vault-root-token -o jsonpath="{.data.${k}}" 2>/dev/null) && [ -n "$OUT" ]; then
                 TOK_B64="$OUT"; break
               fi
             done
             if [ -z "${TOK_B64}" ]; then
-              echo "❌ Could not locate token key in Secret 'vault-root-token' (tried: token, root-token, root_token)."
+              echo "❌ Could not locate token key in Secret 'vault-root-token' (tried: VAULT_TOKEN, token, root-token, root_token)."
               echo "Keys present: $(kubectl -n vault get secret vault-root-token -o jsonpath='{.data}' || true)"
               exit 1
             fi
