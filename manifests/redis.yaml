@@ -345,31 +345,45 @@ spec:
           ports:
             - { containerPort: 6379, name: redis }
           volumeMounts:
-            - { name: data, mountPath: /data }
-            - { name: cfg-ro, mountPath: /config }   # read-only source
+            - { name: data,  mountPath: /data }
+            - { name: cfg-ro, mountPath: /config }    # read-only source
             - { name: cfg-rw, mountPath: /etc/redis } # writable target
-          command: ["/bin/sh","-lc","
-              set -e
-              REDIS_PASSWORD=$(cat /vault/secrets/password)
+          command: ["/bin/sh","-lc"]
+          args:
+            - |
+              set -eu
+              # Read the password without $()
+              if ! read -r REDIS_PASSWORD < /vault/secrets/password; then
+                echo "no password at /vault/secrets/password"; exit 1
+              fi
+
               cp /config/redis.conf /etc/redis/redis.conf
-              echo \"requirepass ${REDIS_PASSWORD}\" >> /etc/redis/redis.conf
-              echo \"masterauth ${REDIS_PASSWORD}\" >> /etc/redis/redis.conf
-              case \"$(hostname)\" in *-0) ;; *) echo 'replicaof redis-0.redis-headless.redis.svc.cluster.local 6379' >> /etc/redis/redis.conf ;; esac
-              trap 'redis-cli -a \"$(cat /vault/secrets/password)\" shutdown nosave || true' TERM INT
+              echo "requirepass ${REDIS_PASSWORD}"  >> /etc/redis/redis.conf
+              echo "masterauth ${REDIS_PASSWORD}"   >> /etc/redis/redis.conf
+
+              HN="$(hostname)"
+              case "$HN" in
+                *-0) : ;;  # primary
+                *) echo 'replicaof redis-0.redis-headless.redis.svc.cluster.local 6379' >> /etc/redis/redis.conf ;;
+              esac
+
+              # Clean shutdown on SIGTERM/SIGINT using the password we already read
+              trap 'redis-cli -a "$REDIS_PASSWORD" shutdown nosave || true' TERM INT
+
               exec redis-server /etc/redis/redis.conf
-            "]
           readinessProbe:
-            exec: { command: ["/bin/sh","-lc","redis-cli -a \"$(cat /vault/secrets/password)\" ping"] }
+            exec:
+              command: ["/bin/sh","-lc","read -r P </vault/secrets/password && redis-cli -a \"$P\" PING | grep -q PONG"]
             initialDelaySeconds: 5
             periodSeconds: 5
           livenessProbe:
-            exec: { command: ["/bin/sh","-lc","redis-cli -a \"$(cat /vault/secrets/password)\" ping"] }
+            exec:
+              command: ["/bin/sh","-lc","read -r P </vault/secrets/password && redis-cli -a \"$P\" PING | grep -q PONG"]
             initialDelaySeconds: 15
             periodSeconds: 10
-
           resources:
             requests: { cpu: "100m", memory: "128Mi" }
-            limits: { memory: "512Mi" }
+            limits:   {           memory: "512Mi" }
 
         - name: sentinel
           image: redis:7.2-alpine
@@ -377,20 +391,26 @@ spec:
           ports:
             - { containerPort: 26379, name: sentinel }
           volumeMounts:
-            - { name: cfg-ro, mountPath: /config }   # read-only source
+            - { name: cfg-ro, mountPath: /config }    # read-only source
             - { name: cfg-rw, mountPath: /etc/redis } # writable target
-          command: ["/bin/sh","-lc","
-              set -e
+          command: ["/bin/sh","-lc"]
+          args:
+            - |
+              set -eu
+              if ! read -r PASSWORD < /vault/secrets/password; then
+                echo "no password at /vault/secrets/password"; exit 1
+              fi
               cp /config/sentinel.conf /etc/redis/sentinel.conf
-              echo \"sentinel auth-pass mymaster $(cat /vault/secrets/password)\" >> /etc/redis/sentinel.conf
+              echo "sentinel auth-pass mymaster ${PASSWORD}" >> /etc/redis/sentinel.conf
               exec redis-sentinel /etc/redis/sentinel.conf
-            "]
           readinessProbe:
-            exec: { command: ["/bin/sh","-lc","redis-cli -a \"$(cat /vault/secrets/password)\" -p 26379 ping"] }
+            exec:
+              command: ["/bin/sh","-lc","read -r P </vault/secrets/password && redis-cli -p 26379 PING | grep -q PONG"]
             initialDelaySeconds: 5
             periodSeconds: 5
           livenessProbe:
-            exec: { command: ["/bin/sh","-lc","redis-cli -a \"$(cat /vault/secrets/password)\" -p 26379 ping"] }
+            exec:
+              command: ["/bin/sh","-lc","read -r P </vault/secrets/password && redis-cli -p 26379 PING | grep -q PONG"]
             initialDelaySeconds: 15
             periodSeconds: 10
 
