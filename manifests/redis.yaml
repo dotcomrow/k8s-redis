@@ -180,11 +180,14 @@ spec:
               VAULT_API POST sys/auth/kubernetes /tmp/auth-enable.json >/dev/null
             fi
 
-            # 4) Upsert ACL policy 'redis-policy'
-            printf 'path "kv/data/redis" { capabilities = ["read"] }\n' > /tmp/redis-policy.hcl
-            /usr/bin/curl -sf -H "X-Vault-Token: ${VAULT_TOKEN}" -H "Content-Type: text/plain" \
-              -X PUT --data-binary @/tmp/redis-policy.hcl \
-              "${VAULT_ADDR}/v1/sys/policies/acl/redis-policy" >/dev/null
+            # 4) Upsert ACL policy 'redis-policy' (JSON payload expected by Vault)
+            printf '%s' \
+              '{"policy":"path \"kv/data/redis\" { capabilities = [\"read\"] }"}' \
+              > /tmp/redis-policy.json
+            VAULT_API PUT sys/policies/acl/redis-policy /tmp/redis-policy.json >/dev/null
+
+            # Optional: verify the policy landed
+            VAULT_API GET sys/policies/acl/redis-policy | /usr/bin/jq -r '.data.policy' || true
 
             # 5) Upsert Kubernetes role bound to SA 'redis' in ns 'redis'
             printf '{"bound_service_account_names":["redis"],"bound_service_account_namespaces":["redis"],"policies":["redis-policy"],"ttl":"24h"}' > /tmp/role.json
