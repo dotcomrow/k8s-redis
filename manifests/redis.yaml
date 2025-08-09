@@ -67,6 +67,12 @@ roleRef:
   kind: Role
   name: secret-writer
 ---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: redis
+  namespace: redis
+---
 apiVersion: batch/v1
 kind: Job
 metadata:
