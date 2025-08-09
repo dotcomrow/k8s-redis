@@ -97,8 +97,18 @@ spec:
             set -Eeuo pipefail
             trap 'echo "❌ Bootstrap failed at line $LINENO"; exit 1' ERR
 
-            echo "📦 Installing utilities (curl jq coreutils)…"
-            apk add --no-cache curl jq coreutils 
+            echo "📦 Installing utilities (ca-certificates openssl curl jq coreutils)…"
+            apk add --no-cache ca-certificates openssl curl jq coreutils
+            update-ca-certificates || true
+
+            # Make sure new binaries are visible to ash; fix PATH and clear command hash
+            export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+            hash -r
+
+            # Sanity check
+            for b in curl jq base64 sed head; do
+              command -v "$b" >/dev/null || { echo "❌ $b not found after install"; exit 1; }
+            done
 
             echo "🔐 Fetching Vault root/admin token from vault namespace…"
             get_tok() {
