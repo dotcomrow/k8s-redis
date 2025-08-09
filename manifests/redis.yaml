@@ -93,20 +93,17 @@ spec:
         command: ["/bin/sh","-lc"]
         args:
           - |
-            set -Eeux  # (no pipefail in BusyBox ash)
+            set -Eeux
             trap 'echo "❌ Bootstrap failed at line $LINENO"; exit 1' ERR
 
-            echo "📦 Installing utilities (curl jq coreutils ca-certificates openssl)…"
-            apk add --no-cache curl jq coreutils ca-certificates openssl
+            echo "📦 Installing utilities (curl jq coreutils ca-certificates openssl grep sed)…"
+            apk add --no-cache curl jq coreutils ca-certificates openssl grep sed
             update-ca-certificates || true
+            export PATH="/usr/sbin:/usr/bin:/sbin:/bin"; hash -r
 
-            # Make sure the shell sees new binaries
-            export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
-            hash -r
-
-            echo "🔎 Sanity check binaries:"
-            ls -l /usr/bin/curl || true
-            /usr/bin/curl --version || { echo "curl still not visible"; exit 1; }
+            # Sanity check
+            /usr/bin/curl --version
+            /usr/bin/jq --version
             /bin/cat /etc/alpine-release || true
 
             echo "🔐 Fetching Vault root/admin token from vault namespace…"
@@ -147,7 +144,7 @@ spec:
               fi
               if [ "$HTTP" -lt 200 ] || [ "$HTTP" -ge 400 ]; then
                 echo "❌ ${METHOD} /v1/${PATH} -> HTTP ${HTTP}"
-                echo "── Response:"; sed 's/^/   /' /tmp/resp.txt
+                echo "── Response:"; /bin/cat /tmp/resp.txt || true
                 exit 1
               fi
               /bin/cat /tmp/resp.txt
@@ -155,17 +152,16 @@ spec:
 
             # 1) Ensure KV v2 at 'kv/'
             MOUNTS_JSON="$(VAULT_API GET sys/mounts)"
-            echo "$MOUNTS_JSON" | grep -q '"kv/":{' || {
+            echo "$MOUNTS_JSON" | /usr/bin/jq -e '."kv/".options.version=="2"' >/dev/null 2>&1 || {
               echo "ℹ️ Enabling KV v2 at path 'kv/'"
               printf '{"type":"kv","options":{"version":"2"}}' > /tmp/kv-enable.json
               VAULT_API POST sys/mounts/kv /tmp/kv-enable.json >/dev/null
             }
+            # sanity re-check
             MOUNTS_JSON="$(VAULT_API GET sys/mounts)"
-            echo "$MOUNTS_JSON" | grep -q '"kv/".*"options":{"version":"2"' || {
-              echo "❌ Mount 'kv/' exists but is not KV v2"; exit 1;
-            }
+            echo "$MOUNTS_JSON" | /usr/bin/jq -e '."kv/".options.version=="2"' >/dev/null
 
-            # 2) Ensure kv/redis secret exists
+            # 2) Ensure kv/redis secret exists (KV v2 data API)
             if ! /usr/bin/curl -sf -H "X-Vault-Token: ${VAULT_TOKEN}" "${VAULT_ADDR}/v1/kv/data/redis" >/dev/null; then
               PW="$(head -c 32 /dev/urandom | base64 | tr -d '\n=')"
               printf '{"data":{"password":"%s"}}' "${PW}" > /tmp/kv.json
@@ -175,14 +171,14 @@ spec:
               echo "🔑 kv/redis already exists; leaving password unchanged."
             fi
 
-            # 3) Ensure kubernetes auth is enabled
+            # 3) Ensure kubernetes auth is enabled (use jq, not grep)
             AUTHS_JSON="$(VAULT_API GET sys/auth)"
-            echo "$AUTHS_JSON" | grep -q '"kubernetes/":{"type":"kubernetes"' || {
+            if ! echo "$AUTHS_JSON" | /usr/bin/jq -e '."kubernetes/".type=="kubernetes"' >/dev/null 2>&1; then
               echo "ℹ️ Enabling kubernetes auth at 'auth/kubernetes'"
               printf '{"type":"kubernetes"}' > /tmp/auth-enable.json
+              # If it's already enabled, Vault would 400; but we only call when jq says it's absent
               VAULT_API POST sys/auth/kubernetes /tmp/auth-enable.json >/dev/null
-              echo "   (Remember to configure auth/kubernetes/config if not already set.)"
-            }
+            fi
 
             # 4) Upsert ACL policy 'redis-policy'
             printf 'path "kv/data/redis" { capabilities = ["read"] }\n' > /tmp/redis-policy.hcl
