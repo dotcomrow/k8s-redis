@@ -99,6 +99,7 @@ spec:
 
             echo "📦 Installing utilities (ca-certificates openssl curl jq coreutils)…"
             apk add --no-cache ca-certificates openssl curl jq coreutils
+            apk add curl
             update-ca-certificates || true
 
             # Make sure new binaries are visible to ash; fix PATH and clear command hash
