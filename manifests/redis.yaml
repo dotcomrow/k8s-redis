@@ -87,7 +87,6 @@ spec:
     spec:
       serviceAccountName: redis-vault-bootstrap
       restartPolicy: OnFailure
-      ttlSecondsAfterFinished: 1800
       securityContext:
         runAsUser: 0
         runAsNonRoot: false
