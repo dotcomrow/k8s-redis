@@ -307,6 +307,7 @@ spec:
           {{ .Data.data.password }}
           {{- end }}
     spec:
+      serviceAccountName: redis
       terminationGracePeriodSeconds: 30
       # Only schedule on work/srvr nodes; avoid ctrl/etcd without new labels
       affinity:
