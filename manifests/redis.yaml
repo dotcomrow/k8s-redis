@@ -98,7 +98,7 @@ spec:
             trap 'echo "❌ Bootstrap failed at line $LINENO"; exit 1' ERR
 
             echo "📦 Installing utilities (curl jq coreutils)…"
-            apk add --no-cache curl jq coreutils >/dev/null
+            apk add --no-cache curl jq coreutils 
 
             echo "🔐 Fetching Vault root/admin token from vault namespace…"
             get_tok() {
