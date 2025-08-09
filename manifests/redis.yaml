@@ -66,6 +66,7 @@ roleRef:
   kind: Role
   name: secret-writer
 ---
+---
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -82,106 +83,111 @@ spec:
       restartPolicy: OnFailure
       ttlSecondsAfterFinished: 1800
       securityContext:
-        runAsUser: 0   # allow apk to install packages
+        runAsUser: 0           # allow apk to install packages
+        runAsNonRoot: false
       containers:
-        - name: bootstrap
-          image: alpine/k8s:1.31.4
-          env:
-            - name: VAULT_ADDR
-              value: "http://vault.vault.svc.cluster.local:8200"
-          command: ["/bin/sh","-lc"]
-          args:
-            - |
-              set -Eeuo pipefail
-              trap 'echo "❌ Bootstrap failed at line $LINENO"; exit 1' ERR
+      - name: bootstrap
+        image: alpine/k8s:1.31.4
+        env:
+          - name: VAULT_ADDR
+            value: "http://vault.vault.svc.cluster.local:8200"  # adjust if different
+        command: ["/bin/sh","-lc"]
+        args:
+          - |
+            set -Eeuo pipefail
+            trap 'echo "❌ Bootstrap failed at line $LINENO"; exit 1' ERR
 
-              echo "🔐 Fetching Vault root/admin token from vault namespace…"
-              get_tok() {
-                key="$1"
-                kubectl -n vault get secret vault-root-token \
-                  -o "go-template={{index .data \"${key}\" | base64decode}}" 2>/dev/null || true
-              }
-              VAULT_TOKEN="$(get_tok VAULT_TOKEN)"
-              [ -n "$VAULT_TOKEN" ] || VAULT_TOKEN="$(get_tok token)"
-              [ -n "$VAULT_TOKEN" ] || VAULT_TOKEN="$(get_tok root-token)"
-              [ -n "$VAULT_TOKEN" ] || VAULT_TOKEN="$(get_tok root_token)"
-              if [ -z "$VAULT_TOKEN" ]; then
-                echo "❌ Could not decode token from Secret 'vault-root-token'. Keys present:"
-                kubectl -n vault get secret vault-root-token -o jsonpath='{.data}'
+            echo "📦 Installing utilities (curl jq coreutils)…"
+            apk add --no-cache curl jq coreutils >/dev/null
+
+            echo "🔐 Fetching Vault root/admin token from vault namespace…"
+            get_tok() {
+              key="$1"
+              kubectl -n vault get secret vault-root-token \
+                -o "go-template={{index .data \"${key}\" | base64decode}}" 2>/dev/null || true
+            }
+            VAULT_TOKEN="$(get_tok VAULT_TOKEN)"
+            [ -n "$VAULT_TOKEN" ] || VAULT_TOKEN="$(get_tok token)"
+            [ -n "$VAULT_TOKEN" ] || VAULT_TOKEN="$(get_tok root-token)"
+            [ -n "$VAULT_TOKEN" ] || VAULT_TOKEN="$(get_tok root_token)"
+            if [ -z "$VAULT_TOKEN" ]; then
+              echo "❌ Could not decode token from Secret 'vault-root-token'. Keys present:"
+              kubectl -n vault get secret vault-root-token -o jsonpath='{.data}' || true
+              exit 1
+            fi
+
+            echo "⏳ Waiting for Vault health at ${VAULT_ADDR}…"
+            i=0
+            until curl -sf -H "X-Vault-Token: ${VAULT_TOKEN}" "${VAULT_ADDR}/v1/sys/health" >/dev/null; do
+              i=$((i+1)); [ "$i" -gt 120 ] && { echo "❌ Vault not healthy after 240s"; exit 1; }
+              sleep 2
+            done
+            echo "✅ Vault reachable. Bootstrapping kv/redis, policy, and k8s role…"
+
+            VAULT_API() {
+              METHOD="$1"; PATH="$2"; BODYFILE="${3:-}";
+              if [ -n "$BODYFILE" ]; then
+                HTTP="$(curl -sS -o /tmp/resp.txt -w '%{http_code}' \
+                  -H "X-Vault-Token: ${VAULT_TOKEN}" -H "Content-Type: application/json" \
+                  -X "$METHOD" --data-binary @"$BODYFILE" \
+                  "${VAULT_ADDR}/v1/${PATH}" || true)"
+              else
+                HTTP="$(curl -sS -o /tmp/resp.txt -w '%{http_code}' \
+                  -H "X-Vault-Token: ${VAULT_TOKEN}" \
+                  -X "$METHOD" "${VAULT_ADDR}/v1/${PATH}" || true)"
+              fi
+              if [ "$HTTP" -lt 200 ] || [ "$HTTP" -ge 400 ]; then
+                echo "❌ ${METHOD} /v1/${PATH} -> HTTP ${HTTP}"
+                echo "── Response:"; sed 's/^/   /' /tmp/resp.txt
                 exit 1
               fi
+              cat /tmp/resp.txt
+            }
 
-              echo "⏳ Waiting for a running Vault server pod…"
-              # Grab the first Running pod with a 'vault' label; adjust selector if yours differs.
-              SEL='app.kubernetes.io/name=vault'
-              for i in $(seq 1 120); do
-                VAULT_POD="$(kubectl -n vault get pod -l "$SEL" \
-                  -o jsonpath='{.items[?(@.status.phase=="Running")][0].metadata.name}' 2>/dev/null || true)"
-                if [ -z "$VAULT_POD" ]; then
-                  # fallback to statefulset naming
-                  kubectl -n vault get pod vault-0 >/dev/null 2>&1 && VAULT_POD="vault-0" || true
-                fi
-                [ -n "$VAULT_POD" ] && break
-                sleep 2
-              done
-              if [ -z "$VAULT_POD" ]; then
-                echo "❌ No running Vault pod found (selector: $SEL, fallback vault-0)."
-                kubectl -n vault get pods -o wide || true
-                exit 1
-              fi
-              echo "✅ Using Vault pod: $VAULT_POD"
+            # 1) Ensure KV v2 is enabled at 'kv/'
+            MOUNTS_JSON="$(VAULT_API GET sys/mounts)"
+            echo "$MOUNTS_JSON" | grep -q '"kv/":{' || {
+              echo "ℹ️ Enabling KV v2 at path 'kv/'"
+              printf '{"type":"kv","options":{"version":"2"}}' > /tmp/kv-enable.json
+              VAULT_API POST sys/mounts/kv /tmp/kv-enable.json >/dev/null
+            }
+            # sanity-check version is v2
+            MOUNTS_JSON="$(VAULT_API GET sys/mounts)"
+            echo "$MOUNTS_JSON" | grep -q '"kv/".*"options":{"version":"2"' || {
+              echo "❌ Mount 'kv/' exists but is not KV v2. Please migrate or change path."
+              exit 1
+            }
 
-              VENV="export VAULT_ADDR='$VAULT_ADDR' VAULT_TOKEN='$VAULT_TOKEN';"
+            # 2) Ensure kv/redis secret exists (KV v2 write to /data)
+            if ! curl -sf -H "X-Vault-Token: ${VAULT_TOKEN}" "${VAULT_ADDR}/v1/kv/data/redis" >/dev/null; then
+              PW="$(head -c 32 /dev/urandom | base64 | tr -d '\n=')"
+              printf '{"data":{"password":"%s"}}' "${PW}" > /tmp/kv.json
+              echo "🔑 Creating kv/redis"
+              VAULT_API POST kv/data/redis /tmp/kv.json >/dev/null
+            else
+              echo "🔑 kv/redis already exists; leaving password unchanged."
+            fi
 
-              echo "🔎 Ensuring KV v2 enabled at path 'kv/'…"
-              kubectl -n vault exec "$VAULT_POD" -- sh -lc "
-                $VENV
-                if ! vault secrets list -format=json | grep -q '\"kv/\"'; then
-                  vault secrets enable -version=2 -path=kv kv
-                else
-                  # verify v2
-                  vault secrets list -detailed -format=json | grep -q '\"kv/\".*\"version\": 2' || {
-                    echo 'kv/ exists but not v2'; exit 1; }
-                fi
-              "
+            # 3) Ensure kubernetes auth method is enabled
+            AUTHS_JSON="$(VAULT_API GET sys/auth)"
+            echo "$AUTHS_JSON" | grep -q '"kubernetes/":{"type":"kubernetes"' || {
+              echo "ℹ️ Enabling kubernetes auth at 'auth/kubernetes'"
+              printf '{"type":"kubernetes"}' > /tmp/auth-enable.json
+              VAULT_API POST sys/auth/kubernetes /tmp/auth-enable.json >/dev/null
+              echo "   (Remember to configure auth/kubernetes/config if not already set.)"
+            }
 
-              echo "🔑 Ensuring kv/redis secret exists…"
-              kubectl -n vault exec "$VAULT_POD" -- sh -lc "
-                $VENV
-                if ! vault kv get -format=json kv/redis >/dev/null 2>&1; then
-                  PW=\$(head -c 32 /dev/urandom | base64 | tr -d '\n=')
-                  vault kv put kv/redis password=\"\$PW\"
-                fi
-              "
+            # 4) Upsert ACL policy 'redis-policy'
+            printf 'path "kv/data/redis" { capabilities = ["read"] }\n' > /tmp/redis-policy.hcl
+            curl -sf -H "X-Vault-Token: ${VAULT_TOKEN}" -H "Content-Type: text/plain" \
+              -X PUT --data-binary @/tmp/redis-policy.hcl \
+              "${VAULT_ADDR}/v1/sys/policies/acl/redis-policy" >/dev/null
 
-              echo "🛡️  Writing redis-policy…"
-              kubectl -n vault exec "$VAULT_POD" -- sh -lc "
-                $VENV
-                cat >/tmp/redis-policy.hcl <<'HCL'
-                path \"kv/data/redis\" {
-                  capabilities = [\"read\"]
-                }
-                HCL
-                vault policy write redis-policy /tmp/redis-policy.hcl
-              "
+            # 5) Upsert Kubernetes role bound to SA 'redis' in ns 'redis'
+            printf '{"bound_service_account_names":["redis"],"bound_service_account_namespaces":["redis"],"policies":["redis-policy"],"ttl":"24h"}' > /tmp/role.json
+            VAULT_API POST auth/kubernetes/role/redis-role /tmp/role.json >/dev/null
 
-              echo "🔓 Ensuring kubernetes auth is enabled…"
-              kubectl -n vault exec "$VAULT_POD" -- sh -lc "
-                $VENV
-                vault auth list -format=json | grep -q '\"kubernetes/\"' || vault auth enable kubernetes
-              "
-
-              echo "👤 Upserting role auth/kubernetes/role/redis-role…"
-              kubectl -n vault exec "$VAULT_POD" -- sh -lc "
-                $VENV
-                vault write auth/kubernetes/role/redis-role \
-                  bound_service_account_names=redis \
-                  bound_service_account_namespaces=redis \
-                  policies=redis-policy \
-                  ttl=24h
-              "
-
-              echo "🎉 Vault bootstrap complete."
+            echo "🎉 Vault bootstrap complete."
 ---
 apiVersion: v1
 kind: Secret
