@@ -8,6 +8,7 @@ metadata:
   annotations:
     linkerd.io/inject: disabled
     field.cattle.io/projectId: local:infrastructure
+    vault.hashicorp.com/agent-injection: enabled
 ---
 apiVersion: v1
 kind: ServiceAccount
