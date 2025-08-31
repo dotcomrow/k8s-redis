@@ -202,16 +202,6 @@ spec:
             echo "🎉 Vault bootstrap complete."
 ---
 apiVersion: v1
-kind: Secret
-metadata:
-  name: redis-auth
-  namespace: redis
-type: Opaque
-data:
-  # change this later: echo -n 'changeMeNow!' | base64
-  password: Y2hhbmdlTWVOb3ch
----
-apiVersion: v1
 kind: ConfigMap
 metadata:
   name: redis-config
