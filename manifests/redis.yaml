@@ -169,7 +169,7 @@ spec:
 
             # 2) Ensure secret/redis exists (KV v2 data API) and capture password
             if ! /usr/bin/curl -sf -H "X-Vault-Token: ${VAULT_TOKEN}" "${VAULT_ADDR}/v1/secret/data/redis" >/dev/null; then
-              VAULT_PW_GEN="$(head -c 32 /dev/urandom | base64 | tr -d '\n=')"
+              VAULT_PW_GEN="$(/usr/bin/openssl rand -base64 32 | tr -d '\n=')"
               printf '{"data":{"password":"%s"}}' "${VAULT_PW_GEN}" > /tmp/secret-redis.json
               echo "🔑 Creating secret/redis"
               VAULT_API POST secret/data/redis /tmp/secret-redis.json >/dev/null
@@ -201,7 +201,7 @@ spec:
 
             # 6) Mirror password from Vault into a k8s Secret 'redis-auth' (for clients like RedisInsight)
             echo "🔁 Syncing password into Secret redis/redis-auth"
-            B64PW="$(printf '%s' "${VAULT_PW}" | base64 -w0)"
+            B64PW="$(printf '%s' "${VAULT_PW}" | /usr/bin/openssl base64 -A)"
             cat > /tmp/redis-auth.yaml <<EOF
             apiVersion: v1
             kind: Secret
@@ -216,7 +216,7 @@ spec:
 
             # 7) Ensure secret/redisinsight has RI_ENCRYPTION_KEY and mirror to k8s
             if ! /usr/bin/curl -sf -H "X-Vault-Token: ${VAULT_TOKEN}" "${VAULT_ADDR}/v1/secret/data/redisinsight" >/dev/null; then
-              ENC_KEY="$(openssl rand -base64 48 | tr -d '\n=')"   # long random string
+              ENC_KEY="$(/usr/bin/openssl rand -base64 48 | tr -d '\n=')"   # long random string
               printf '{"data":{"RI_ENCRYPTION_KEY":"%s"}}' "${ENC_KEY}" > /tmp/secret-redisinsight.json
               echo "🔐 Creating secret/redisinsight"
               VAULT_API POST secret/data/redisinsight /tmp/secret-redisinsight.json >/dev/null
@@ -228,7 +228,7 @@ spec:
             fi
 
             echo "🔁 Syncing RedisInsight encryption key into Secret redis/redisinsight-secrets"
-            B64_RI_KEY="$(printf '%s' "${RI_KEY}" | base64 -w0)"
+            B64_RI_KEY="$(printf '%s' "${RI_KEY}" | /usr/bin/openssl base64 -A)"
             cat > /tmp/redisinsight-secrets.yaml <<EOF
             apiVersion: v1
             kind: Secret
