@@ -117,79 +117,84 @@ spec:
           apk add --no-cache curl jq kubectl coreutils ca-certificates openssl grep sed >/dev/null
           update-ca-certificates >/dev/null
 
-          # Helper to call Vault
-          VAULT_API () {
+          VAULT_API() {
             METHOD="$1"; PATH_="$2"; BODYFILE="${3:-}"
-            [ -n "${BODYFILE}" ] && DATA=( -H "Content-Type: application/json" --data-binary @"${BODYFILE}" ) || DATA=()
-            HTTP=$(
-              curl -sS -o /tmp/resp.txt -w '%{http_code}' -H "X-Vault-Token: ${VAULT_TOKEN}" -X "${METHOD}" "${VAULT_ADDR}/v1/${PATH_}" "${DATA[@]}"
-            )
-            if [ "${HTTP}" -ge 400 ] || [ "${HTTP}" -lt 200 ]; then
-              echo "Vault API ${METHOD} ${PATH_} failed (HTTP ${HTTP})"
+            if [ -n "$BODYFILE" ]; then
+              HTTP="$(curl -sS -o /tmp/resp.txt -w '%{http_code}' \
+                -H "X-Vault-Token: $VAULT_TOKEN" -H "Content-Type: application/json" \
+                -X "$METHOD" --data-binary @"$BODYFILE" "$VAULT_ADDR/v1/$PATH_")"
+            else
+              HTTP="$(curl -sS -o /tmp/resp.txt -w '%{http_code}' \
+                -H "X-Vault-Token: $VAULT_TOKEN" \
+                -X "$METHOD" "$VAULT_ADDR/v1/$PATH_")"
+            fi
+            if [ "$HTTP" -ge 400 ] || [ "$HTTP" -lt 200 ]; then
+              echo "Vault API $METHOD $PATH_ failed (HTTP $HTTP)"
               cat /tmp/resp.txt || true
               exit 1
             fi
             cat /tmp/resp.txt
           }
 
-          echo "🔐 Fetching Vault root/admin token from ${VAULT_NS}/${VAULT_ROOT_SECRET_NAME}…"
-          VAULT_TOKEN="$(kubectl -n "${VAULT_NS}" get secret "${VAULT_ROOT_SECRET_NAME}" -o 'go-template={{index .data "VAULT_TOKEN" | base64decode}}')"
-          [ -n "${VAULT_TOKEN}" ]
+          echo "🔐 Fetching Vault root/admin token from $VAULT_NS/$VAULT_ROOT_SECRET_NAME…"
+          VAULT_TOKEN="$(kubectl -n "$VAULT_NS" get secret "$VAULT_ROOT_SECRET_NAME" -o 'go-template={{index .data "VAULT_TOKEN" | base64decode}}')"
+          [ -n "$VAULT_TOKEN" ]
 
-          echo "⏳ Waiting for Vault health at ${VAULT_ADDR}…"
+          echo "⏳ Waiting for Vault health at $VAULT_ADDR…"
           i=0
-          until curl -sf -H "X-Vault-Token: ${VAULT_TOKEN}" "${VAULT_ADDR}/v1/sys/health" >/dev/null; do
-            i=$((i+1)); [ "${i}" -gt 60 ] && { echo "Vault not healthy"; exit 1; }
+          until curl -sf -H "X-Vault-Token: $VAULT_TOKEN" "$VAULT_ADDR/v1/sys/health" >/dev/null; do
+            i=$((i+1)); [ "$i" -gt 60 ] && { echo "Vault not healthy"; exit 1; }
             sleep 2
           done
           echo "✅ Vault reachable. Bootstrapping secret/redis, secret/redisinsight, policy, roles, and Secrets…"
 
           # Ensure secret/ is KV v2
           MOUNTS_JSON="$(VAULT_API GET sys/mounts)"
-          echo "${MOUNTS_JSON}" | jq -e '."secret/".options.version=="2"' >/dev/null
+          printf '%s' "$MOUNTS_JSON" | jq -e '."secret/".options.version=="2"' >/dev/null
 
           # ── Redis password in Vault (create if missing)
-          if ! REDIS_JSON="$(curl -sf -H "X-Vault-Token: ${VAULT_TOKEN}" "${VAULT_ADDR}/${VAULT_REDIS_PATH}")"; then
-            echo "🔑 Creating new password at ${VAULT_REDIS_PATH}"
+          if ! REDIS_JSON="$(curl -sf -H "X-Vault-Token: $VAULT_TOKEN" "$VAULT_ADDR/$VAULT_REDIS_PATH")"; then
+            echo "🔑 Creating new password at $VAULT_REDIS_PATH"
             PW="$(openssl rand -base64 32)"
-            printf '{"data":{"password":"%s"}}' "${PW}" > /tmp/secret-redis.json
-            VAULT_API POST "${VAULT_REDIS_PATH}" /tmp/secret-redis.json >/dev/null
-            VAULT_PW="${PW}"
+            printf '{"data":{"password":"%s"}}' "$PW" > /tmp/secret-redis.json
+            VAULT_API POST "$VAULT_REDIS_PATH" /tmp/secret-redis.json >/dev/null
+            VAULT_PW="$PW"
           else
-            VAULT_PW="$(printf '%s' "${REDIS_JSON}" | jq -r '.data.data.password')"
-            [ -n "${VAULT_PW}" ] && [ "${VAULT_PW}" != "null" ] || {
-              echo "ℹ️ password field missing; generating..."
+            VAULT_PW="$(printf '%s' "$REDIS_JSON" | jq -r '.data.data.password')"
+            if [ -z "$VAULT_PW" ] || [ "$VAULT_PW" = "null" ]; then
+              echo "ℹ️ password field missing; generating…"
               PW="$(openssl rand -base64 32)"
-              printf '{"data":{"password":"%s"}}' "${PW}" > /tmp/secret-redis.json
-              VAULT_API POST "${VAULT_REDIS_PATH}" /tmp/secret-redis.json >/dev/null
-              VAULT_PW="${PW}"
-            }
+              printf '{"data":{"password":"%s"}}' "$PW" > /tmp/secret-redis.json
+              VAULT_API POST "$VAULT_REDIS_PATH" /tmp/secret-redis.json >/dev/null
+              VAULT_PW="$PW"
+            fi
           fi
 
           # ── Kubernetes auth present
           AUTHS_JSON="$(VAULT_API GET sys/auth)"
-          echo "${AUTHS_JSON}" | jq -e '."kubernetes/".type=="kubernetes"' >/dev/null
+          printf '%s' "$AUTHS_JSON" | jq -e '."kubernetes/".type=="kubernetes"' >/dev/null
 
           # ── Policy to read secret/redis
-          printf '%s' \
-          "{\"policy\":\"path \\\"${VAULT_REDIS_PATH}\\\" { capabilities = [\\\"read\\\"] }
-          path \\\"${VAULT_REDIS_META}\\\" { capabilities = [\\\"read\\\"] }\"}" \
-            > /tmp/redis-policy.json
-          VAULT_API PUT "sys/policies/acl/${VAULT_K8S_POLICY}" /tmp/redis-policy.json >/dev/null
-          echo "📝 Policy ${VAULT_K8S_POLICY} ensured"
+          cat >/tmp/redis-policy.json <<POL
+          {"policy":"path \"${VAULT_REDIS_PATH}\" { capabilities = [\"read\"] }
+          path \"${VAULT_REDIS_META}\" { capabilities = [\"read\"] }"}
+          POL
+          VAULT_API PUT "sys/policies/acl/$VAULT_K8S_POLICY" /tmp/redis-policy.json >/dev/null
+          echo "📝 Policy $VAULT_K8S_POLICY ensured"
 
           # ── Role bound to SA to read that policy
-          printf '%s' \
-          "{\"bound_service_account_names\":[\"${VAULT_K8S_SA}\"],
-            \"bound_service_account_namespaces\":[\"${APP_NS}\"],
-            \"policies\":[\"${VAULT_K8S_POLICY}\"],
-            \"ttl\":\"24h\"}" > /tmp/role.json
-          VAULT_API POST "auth/kubernetes/role/${VAULT_K8S_ROLE}" /tmp/role.json >/devnull 2>&1 || VAULT_API POST "auth/kubernetes/role/${VAULT_K8S_ROLE}" /tmp/role.json >/dev/null
-          echo "👤 Role ${VAULT_K8S_ROLE} ensured"
+          cat >/tmp/role.json <<ROLE
+          {"bound_service_account_names":["${VAULT_K8S_SA}"],
+           "bound_service_account_namespaces":["${APP_NS}"],
+           "policies":["${VAULT_K8S_POLICY}"],
+           "ttl":"24h"}
+          ROLE
+          VAULT_API POST "auth/kubernetes/role/$VAULT_K8S_ROLE" /tmp/role.json >/dev/null
+          echo "👤 Role $VAULT_K8S_ROLE ensured"
 
           # ── Sync Redis password into K8s Secret in ${APP_NS}
-          B64PW="$(printf '%s' "${VAULT_PW}" | openssl base64 -A)"
-          cat <<EOF | kubectl apply -n "${APP_NS}" -f -
+          B64PW="$(printf '%s' "$VAULT_PW" | openssl base64 -A)"
+          cat <<EOF | kubectl apply -n "$APP_NS" -f -
           apiVersion: v1
           kind: Secret
           metadata:
@@ -202,26 +207,27 @@ spec:
           echo "🔁 Synced redis-auth Secret in namespace ${APP_NS}"
 
           # ── RedisInsight encryption key (create if missing)
-          if ! RI_JSON="$(curl -sf -H "X-Vault-Token: ${VAULT_TOKEN}" "${VAULT_ADDR}/${VAULT_RI_PATH}")"; then
-            echo "🔐 Creating new RI_ENCRYPTION_KEY at ${VAULT_RI_PATH}"
-            ENC_KEY="$(openssl rand -base64 48)"
-            printf '{"data":{"RI_ENCRYPTION_KEY":"%s"}}' "${ENC_KEY}" > /tmp/secret-ri.json
-            VAULT_API POST "${VAULT_RI_PATH}" /tmp/secret-ri.json >/dev/null
-            RI_KEY="${ENC_KEY}"
+          if ! RI_JSON="$(curl -sf -H "X-Vault-Token: $VAULT_TOKEN" "$VAULT_ADDR/$VAULT_RI_PATH")"; then
+            echo "🔐 Creating new RI_ENCRYPTION_KEY at $VAULT_RI_PATH"
+            # Strip trailing newline with sed (no bashisms; no tr dependency)
+            ENC_KEY="$(openssl rand -base64 48 | sed -e ':a' -e 'N' -e '$!ba' -e 's/\n//g')"
+            printf '{"data":{"RI_ENCRYPTION_KEY":"%s"}}' "$ENC_KEY" > /tmp/secret-ri.json
+            VAULT_API POST "$VAULT_RI_PATH" /tmp/secret-ri.json >/dev/null
+            RI_KEY="$ENC_KEY"
           else
-            RI_KEY="$(printf '%s' "${RI_JSON}" | jq -r '.data.data.RI_ENCRYPTION_KEY')"
-            [ -n "${RI_KEY}" ] && [ "${RI_KEY}" != "null" ] || {
+            RI_KEY="$(printf '%s' "$RI_JSON" | jq -r '.data.data.RI_ENCRYPTION_KEY')"
+            if [ -z "$RI_KEY" ] || [ "$RI_KEY" = "null" ]; then
               echo "ℹ️ RI_ENCRYPTION_KEY missing; generating…"
-              ENC_KEY="$(openssl rand -base64 48)"
-              printf '{"data":{"RI_ENCRYPTION_KEY":"%s"}}' "${ENC_KEY}" > /tmp/secret-ri.json
-              VAULT_API POST "${VAULT_RI_PATH}" /tmp/secret-ri.json >/dev/null
-              RI_KEY="${ENC_KEY}"
-            }
+              ENC_KEY="$(openssl rand -base64 48 | sed -e ':a' -e 'N' -e '$!ba' -e 's/\n//g')"
+              printf '{"data":{"RI_ENCRYPTION_KEY":"%s"}}' "$ENC_KEY" > /tmp/secret-ri.json
+              VAULT_API POST "$VAULT_RI_PATH" /tmp/secret-ri.json >/dev/null
+              RI_KEY="$ENC_KEY"
+            fi
           fi
 
           # ── Sync RI key into K8s Secret in ${APP_NS}
-          B64_RI_KEY="$(printf '%s' "${RI_KEY}" | openssl base64 -A)"
-          cat <<EOF | kubectl apply -n "${APP_NS}" -f -
+          B64_RI_KEY="$(printf '%s' "$RI_KEY" | openssl base64 -A)"
+          cat <<EOF | kubectl apply -n "$APP_NS" -f -
           apiVersion: v1
           kind: Secret
           metadata:
