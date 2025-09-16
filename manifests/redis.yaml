@@ -107,15 +107,16 @@ spec:
             update-ca-certificates || true
             export PATH="/usr/sbin:/usr/bin:/sbin:/bin"; hash -r
 
-            # Sanity check
+            # Sanity checks
             /usr/bin/curl --version
             /usr/bin/jq --version
+            /usr/bin/kubectl version --client --output=yaml || true
             /bin/cat /etc/alpine-release || true
 
             echo "🔐 Fetching Vault root/admin token from vault namespace…"
             get_tok() {
               key="$1"
-              kubectl -n vault get secret vault-root-token \
+              /usr/bin/kubectl -n vault get secret vault-root-token \
                 -o "go-template={{index .data \"${key}\" | base64decode}}" 2>/dev/null || true
             }
             VAULT_TOKEN="$(get_tok VAULT_TOKEN)"
@@ -124,7 +125,7 @@ spec:
             [ -n "${VAULT_TOKEN}" ] || VAULT_TOKEN="$(get_tok root_token)"
             if [ -z "${VAULT_TOKEN}" ]; then
               echo "❌ Could not decode token from Secret 'vault-root-token'. Keys present:"
-              kubectl -n vault get secret vault-root-token -o jsonpath='{.data}' || true
+              /usr/bin/kubectl -n vault get secret vault-root-token -o jsonpath='{.data}' || true
               exit 1
             fi
 
@@ -156,18 +157,17 @@ spec:
               /bin/cat /tmp/resp.txt
             }
 
-            # 1) Ensure KV v2 at 'secret/' (default mount)
+            # 1) Ensure KV v2 at 'secret/'
             MOUNTS_JSON="$(VAULT_API GET sys/mounts)"
             echo "$MOUNTS_JSON" | /usr/bin/jq -e '."secret/".options.version=="2"' >/dev/null 2>&1 || {
               echo "ℹ️ Enabling KV v2 at path 'secret/'"
               printf '{"type":"kv","options":{"version":"2"}}' > /tmp/secret-enable.json
               VAULT_API POST sys/mounts/secret /tmp/secret-enable.json >/dev/null
             }
-            # sanity re-check
             MOUNTS_JSON="$(VAULT_API GET sys/mounts)"
             echo "$MOUNTS_JSON" | /usr/bin/jq -e '."secret/".options.version=="2"' >/dev/null
 
-            # 2) Ensure secret/redis exists (KV v2 data API) and capture password
+            # 2) Ensure secret/redis exists (KV v2 data API)
             if ! /usr/bin/curl -sf -H "X-Vault-Token: ${VAULT_TOKEN}" "${VAULT_ADDR}/v1/secret/data/redis" >/dev/null; then
               VAULT_PW_GEN="$(/usr/bin/openssl rand -base64 32 | tr -d '\n=')"
               printf '{"data":{"password":"%s"}}' "${VAULT_PW_GEN}" > /tmp/secret-redis.json
@@ -188,7 +188,7 @@ spec:
               VAULT_API POST sys/auth/kubernetes /tmp/auth-enable.json >/dev/null
             fi
 
-            # 4) Upsert ACL policy 'redis-policy' for secret/ (KV v2 data/metadata)
+            # 4) Upsert ACL policy 'redis-policy' for secret/
             printf '%s' \
               '{"policy":"path \"secret/data/redis\" { capabilities = [\"read\"] }\npath \"secret/metadata/redis\" { capabilities = [\"read\"] }"}' \
               > /tmp/redis-policy.json
@@ -199,10 +199,10 @@ spec:
             printf '{"bound_service_account_names":["redis"],"bound_service_account_namespaces":["redis"],"policies":["redis-policy"],"ttl":"24h"}' > /tmp/role.json
             VAULT_API POST auth/kubernetes/role/redis-role /tmp/role.json >/dev/null
 
-            # 6) Mirror password from Vault into a k8s Secret 'redis-auth' (for clients like RedisInsight)
+            # 6) Mirror password from Vault into a k8s Secret 'redis-auth'
             echo "🔁 Syncing password into Secret redis/redis-auth"
             B64PW="$(printf '%s' "${VAULT_PW}" | /usr/bin/openssl base64 -A)"
-            kubectl apply -n redis -f - <<EOF
+            /usr/bin/kubectl apply -n redis -f - <<EOF
             apiVersion: v1
             kind: Secret
             metadata:
@@ -228,7 +228,7 @@ spec:
 
             echo "🔁 Syncing RedisInsight encryption key into Secret redis/redisinsight-secrets"
             B64_RI_KEY="$(printf '%s' "${RI_KEY}" | /usr/bin/openssl base64 -A)"
-            kubectl apply -n redis -f - <<EOF
+            /usr/bin/kubectl apply -n redis -f - <<EOF
             apiVersion: v1
             kind: Secret
             metadata:
