@@ -202,7 +202,7 @@ spec:
             # 6) Mirror password from Vault into a k8s Secret 'redis-auth' (for clients like RedisInsight)
             echo "🔁 Syncing password into Secret redis/redis-auth"
             B64PW="$(printf '%s' "${VAULT_PW}" | /usr/bin/openssl base64 -A)"
-            cat > /tmp/redis-auth.yaml <<EOF
+            kubectl apply -n redis -f - <<EOF
             apiVersion: v1
             kind: Secret
             metadata:
@@ -212,7 +212,6 @@ spec:
             data:
               password: ${B64PW}
             EOF
-            kubectl apply -f /tmp/redis-auth.yaml
 
             # 7) Ensure secret/redisinsight has RI_ENCRYPTION_KEY and mirror to k8s
             if ! /usr/bin/curl -sf -H "X-Vault-Token: ${VAULT_TOKEN}" "${VAULT_ADDR}/v1/secret/data/redisinsight" >/dev/null; then
@@ -229,7 +228,7 @@ spec:
 
             echo "🔁 Syncing RedisInsight encryption key into Secret redis/redisinsight-secrets"
             B64_RI_KEY="$(printf '%s' "${RI_KEY}" | /usr/bin/openssl base64 -A)"
-            cat > /tmp/redisinsight-secrets.yaml <<EOF
+            kubectl apply -n redis -f - <<EOF
             apiVersion: v1
             kind: Secret
             metadata:
@@ -239,7 +238,6 @@ spec:
             data:
               RI_ENCRYPTION_KEY: ${B64_RI_KEY}
             EOF
-            kubectl apply -f /tmp/redisinsight-secrets.yaml
 
             echo "🎉 Vault bootstrap complete."
 ---
