@@ -10,13 +10,20 @@ metadata:
     field.cattle.io/projectId: local:infrastructure
     vault.hashicorp.com/agent-injection: enabled
 ---
+# --- Service Accounts ---------------------------------------------------------
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: redis-vault-bootstrap
+  name: vault-bootstrap
   namespace: redis
 ---
-# In the vault ns: allow reading just the 'vault-root-token' Secret
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: redis
+  namespace: redis
+---
+# --- RBAC: allow reading the Vault root token (in vault ns) -------------------
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -25,24 +32,24 @@ metadata:
 rules:
 - apiGroups: [""]
   resources: ["secrets"]
-  resourceNames: ["vault-root-token"]   # tighten to the exact Secret name you use
+  resourceNames: ["vault-root-token"]
   verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: allow-redis-bootstrap-to-read-root-token
+  name: allow-vault-bootstrap-to-read-root-token
   namespace: vault
 subjects:
 - kind: ServiceAccount
-  name: redis-vault-bootstrap
+  name: vault-bootstrap
   namespace: redis
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
   name: read-vault-root-token
 ---
-# In the redis ns: allow creating/updating Secrets (only if you want to write any there)
+# --- RBAC: allow writing Secrets in redis ns ---------------------------------
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -56,89 +63,29 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: allow-redis-bootstrap-secret-write
+  name: allow-vault-bootstrap-secret-write
   namespace: redis
 subjects:
 - kind: ServiceAccount
-  name: redis-vault-bootstrap
+  name: vault-bootstrap
   namespace: redis
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
   name: secret-writer
 ---
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: redis
-  namespace: redis
----
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: vault-bootstrap
-  namespace: redis
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: redis-secret-writer
-  namespace: redis
-rules:
-  - apiGroups: [""]
-    resources: ["secrets"]
-    verbs: ["get", "create", "update", "patch", "list"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: redis-secret-writer-binding
-  namespace: redis
-subjects:
-  - kind: ServiceAccount
-    name: vault-bootstrap
-    namespace: redis
-roleRef:
-  kind: Role
-  apiGroup: rbac.authorization.k8s.io
-  name: redis-secret-writer
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: vault-token-reader
-  namespace: vault
-rules:
-  - apiGroups: [""]
-    resources: ["secrets"]
-    resourceNames: ["vault-root-token"]
-    verbs: ["get"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: vault-token-reader-binding
-  namespace: vault
-subjects:
-  - kind: ServiceAccount
-    name: vault-bootstrap
-    namespace: redis
-roleRef:
-  kind: Role
-  apiGroup: rbac.authorization.k8s.io
-  name: vault-token-reader
----
+# --- ONE merged bootstrap Job: Vault + Redis + RedisInsight + RDI ------------
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: vault-redis-bootstrap
+  name: vault-redis-rdi-bootstrap
   namespace: redis
 spec:
   backoffLimit: 0
   template:
     metadata:
       labels:
-        app: vault-redis-bootstrap
+        app: vault-redis-rdi-bootstrap
     spec:
       serviceAccountName: vault-bootstrap
       restartPolicy: Never
@@ -149,14 +96,31 @@ spec:
           env:
             - name: VAULT_ADDR
               value: "http://vault.vault.svc.cluster.local:8200"
-            # Override if your Redis workload uses a different SA/namespace
+            - name: B64_LINE_WRAP
+              value: "A"   # openssl base64 -A (no wrap)
+
+            # Vault KV v2 paths
+            - name: VAULT_REDIS_PATH_DATA
+              value: "secret/data/redis"
+            - name: VAULT_RI_PATH_DATA
+              value: "secret/data/redisinsight"
+            - name: VAULT_RDI_PATH_DATA
+              value: "secret/data/rdi/api"
+
+            # K8s Secret names materialized from Vault values
+            - name: K8S_SECRET_REDIS_AUTH
+              value: "redis-auth"
+            - name: K8S_SECRET_RI
+              value: "redisinsight-secrets"
+            - name: K8S_SECRET_RDI
+              value: "rdi-api-jwt"
+
+            # (Optional) Vault K8s auth policy/role for redis Pods
             - name: VAULT_K8S_ROLE
               value: "redis-role"
             - name: VAULT_K8S_POLICY
               value: "redis-policy"
-            - name: B64_LINE_WRAP
-              value: "A" # openssl base64 -A (no wrap)
-          command: ["/bin/sh", "-c"]
+          command: ["/bin/sh","-c"]
           args:
             - |
               set -eu
@@ -165,7 +129,6 @@ spec:
               apk add --no-cache curl jq kubectl coreutils ca-certificates openssl grep sed >/dev/null
               update-ca-certificates >/dev/null 2>&1 || true
 
-              # Helper: Vault API
               VAULT_API() {
                 _m="$1"; _p="$2"; _body="${3:-}"
                 if [ -n "$_body" ]; then
@@ -175,85 +138,106 @@ spec:
                 fi
               }
 
-              echo "🔐 Fetching Vault root/admin token from vault/vault-root-token…"
+              echo "🔐 Fetching Vault admin token from vault/vault-root-token…"
               VAULT_TOKEN="$(kubectl -n vault get secret vault-root-token -o 'go-template={{index .data "VAULT_TOKEN" | base64decode}}')"
 
               echo "⏳ Waiting for Vault health at ${VAULT_ADDR}…"
               i=0
               until curl -sf -H "X-Vault-Token: $VAULT_TOKEN" "$VAULT_ADDR/v1/sys/health" >/dev/null; do
                 i=$((i+1))
-                [ "$i" -gt 90 ] && echo "❌ Vault not healthy in time" && exit 1
+                [ "$i" -gt 120 ] && echo "❌ Vault not healthy in time" && exit 1
                 sleep 2
               done
-              echo "✅ Vault reachable. Bootstrapping secret/redis, secret/redisinsight, policy, roles, and Secrets…"
+              echo "✅ Vault reachable."
 
-              # Ensure secret/ is a KV v2 mount
+              echo "🔎 Verifying 'secret/' is KV v2…"
               MOUNTS_JSON="$(VAULT_API GET sys/mounts)"
               if ! printf '%s' "$MOUNTS_JSON" | jq -e '."secret/".type=="kv" and (."secret/".options.version=="2")' >/dev/null 2>&1; then
                 echo "❌ Vault mount secret/ is missing or not KV v2"; exit 1
               fi
 
-              # --------- Redis password in Vault (secret/redis) ----------
+              # --- 1) Redis password -> Vault -> K8s Secret redis-auth ---------
+              echo "🧩 Ensuring Redis password at $VAULT_REDIS_PATH_DATA…"
               set +e
-              EXISTING_JSON="$(curl -sf -H "X-Vault-Token: $VAULT_TOKEN" "$VAULT_ADDR/v1/secret/data/redis" 2>/dev/null)"
+              REDIS_PW="$(VAULT_API GET "$VAULT_REDIS_PATH_DATA" | jq -er '.data.data.password' 2>/dev/null)"
               rc=$?
               set -e
-
-              if [ $rc -ne 0 ]; then
-                PW="$(openssl rand -base64 36)"
-                BODY="$(jq -Rn --arg p "$PW" '{data:{password:$p}}')"
-                echo "🔑 Creating new password at secret/data/redis"
-                echo "…payload:"
-                echo "$BODY"
-                VAULT_API POST secret/data/redis "$BODY" >/dev/null
+              if [ $rc -ne 0 ] || [ -z "${REDIS_PW:-}" ]; then
+                REDIS_PW="$(openssl rand -base64 36)"
+                BODY="$(jq -Rn --arg p "$REDIS_PW" '{data:{password:$p}}')"
+                VAULT_API POST "$VAULT_REDIS_PATH_DATA" "$BODY" >/dev/null
+                echo "✅ Created new Redis password in Vault."
               else
-                PW="$(printf '%s' "$EXISTING_JSON" | jq -r '.data.data.password')"
-                echo "🔑 Reusing existing password at secret/data/redis (len=$(printf '%s' "$PW" | wc -c))"
+                echo "♻️  Reusing existing Redis password (len=$(printf '%s' "$REDIS_PW" | wc -c))"
               fi
 
-              # --------- Kubernetes Secret redis/redis-auth ----------
-              B64PW="$(printf '%s' "$PW" | openssl base64 -$B64_LINE_WRAP)"
-              echo "🧾 Applying Secret redis/redis-auth"
+              echo "🧾 Applying Secret ${K8S_SECRET_REDIS_AUTH} (redis)…"
+              B64PW="$(printf '%s' "$REDIS_PW" | openssl base64 -$B64_LINE_WRAP)"
               cat <<EOF | kubectl apply -n redis -f -
               apiVersion: v1
               kind: Secret
               metadata:
-                name: redis-auth
+                name: ${K8S_SECRET_REDIS_AUTH}
               type: Opaque
               data:
                 password: ${B64PW}
               EOF
 
-              # --------- RedisInsight encryption key in Vault ----------
+              # --- 2) RedisInsight encryption key -> Vault -> K8s Secret -------
+              echo "🧩 Ensuring RedisInsight key at $VAULT_RI_PATH_DATA…"
               set +e
-              RI_JSON="$(curl -sf -H "X-Vault-Token: $VAULT_TOKEN" "$VAULT_ADDR/v1/secret/data/redisinsight" 2>/dev/null)"
+              RI_KEY="$(VAULT_API GET "$VAULT_RI_PATH_DATA" | jq -er '.data.data.encryption_key' 2>/dev/null)"
               rc=$?
               set -e
-              if [ $rc -ne 0 ]; then
-                # 48 base64 bytes, strip newline/=
+              if [ $rc -ne 0 ] || [ -z "${RI_KEY:-}" ]; then
                 RI_KEY="$(openssl rand -base64 48 | tr -d '\n=')"
                 RI_BODY="$(jq -Rn --arg k "$RI_KEY" '{data:{encryption_key:$k}}')"
-                echo "🗝️  Creating new encryption key at secret/data/redisinsight"
-                VAULT_API POST secret/data/redisinsight "$RI_BODY" >/dev/null
+                VAULT_API POST "$VAULT_RI_PATH_DATA" "$RI_BODY" >/dev/null
+                echo "✅ Created new RedisInsight encryption key in Vault."
               else
-                RI_KEY="$(printf '%s' "$RI_JSON" | jq -r '.data.data.encryption_key')"
-                echo "🗝️  Reusing existing encryption key at secret/data/redisinsight (len=$(printf '%s' "$RI_KEY" | wc -c))"
+                echo "♻️  Reusing existing RedisInsight encryption key (len=$(printf '%s' "$RI_KEY" | wc -c))"
               fi
 
-              # --------- Kubernetes Secret for RedisInsight ----------
+              echo "🧾 Applying Secret ${K8S_SECRET_RI} (redis)…"
               B64_RI="$(printf '%s' "$RI_KEY" | openssl base64 -$B64_LINE_WRAP)"
-              echo "🧾 Applying Secret redis/redisinsight-secrets"
               cat <<EOF | kubectl apply -n redis -f -
               apiVersion: v1
               kind: Secret
               metadata:
-                name: redisinsight-secrets
+                name: ${K8S_SECRET_RI}
               type: Opaque
               data:
                 RI_APP_ENCRYPTION_KEY: ${B64_RI}
               EOF
 
-              # --------- Optional: Vault policy/role (only if k8s auth is enabled) ----------
+              # --- 3) RDI API jwtKey -> Vault -> K8s Secret rdi-api-jwt --------
+              echo "🧩 Ensuring RDI API jwtKey at $VAULT_RDI_PATH_DATA…"
+              set +e
+              RDI_JWT="$(VAULT_API GET "$VAULT_RDI_PATH_DATA" | jq -er '.data.data.jwtKey' 2>/dev/null)"
+              rc=$?
+              set -e
+              if [ $rc -ne 0 ] || [ -z "${RDI_JWT:-}" ]; then
+                RDI_JWT="$(openssl rand -base64 48 | tr -d '\n=')"
+                RDI_BODY="$(jq -Rn --arg k "$RDI_JWT" '{data:{jwtKey:$k}}')"
+                VAULT_API POST "$VAULT_RDI_PATH_DATA" "$RDI_BODY" >/dev/null
+                echo "✅ Created new RDI jwtKey in Vault."
+              else
+                echo "♻️  Reusing existing RDI jwtKey (len=$(printf '%s' "$RDI_JWT" | wc -c))"
+              fi
+
+              echo "🧾 Applying Secret ${K8S_SECRET_RDI} (redis)…"
+              B64JWT="$(printf '%s' "$RDI_JWT" | openssl base64 -$B64_LINE_WRAP)"
+              cat <<EOF | kubectl apply -n redis -f -
+              apiVersion: v1
+              kind: Secret
+              metadata:
+                name: ${K8S_SECRET_RDI}
+              type: Opaque
+              data:
+                jwtKey: ${B64JWT}
+              EOF
+
+              # --- 4) (Optional) Vault policy/role for redis Pods --------------
               echo "🔎 Checking Vault auth backends…"
               SKIP_K8S_AUTH=0
               if AUTHS_JSON="$(VAULT_API GET sys/auth)"; then
@@ -281,8 +265,9 @@ spec:
                 echo "ℹ️  Skipped policy/role creation."
               fi
 
-              echo "✅ Bootstrap complete."
+              echo "✅ Vault + Redis + RDI bootstrap complete."
 ---
+# --- Redis config -------------------------------------------------------------
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -294,14 +279,9 @@ data:
     bind 0.0.0.0
     protected-mode no
     appendonly yes
-    # RDB off by default; add 'save 900 1' if you want snapshots
     save ""
     tcp-keepalive 300
     timeout 0
-    # Auth is injected at runtime via command args:
-    #   requirepass <password>
-    #   masterauth <password>
-
   sentinel.conf: |
     port 26379
     bind 0.0.0.0
@@ -312,8 +292,8 @@ data:
     sentinel parallel-syncs mymaster 1
     sentinel failover-timeout mymaster 60000
     sentinel resolve-hostnames yes
-
 ---
+# --- Services -----------------------------------------------------------------
 apiVersion: v1
 kind: Service
 metadata:
@@ -360,6 +340,7 @@ spec:
       port: 26379
       targetPort: 26379
 ---
+# --- Redis StatefulSet + Sentinel --------------------------------------------
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -377,7 +358,6 @@ spec:
       annotations:
         vault.hashicorp.com/agent-inject: "true"
         vault.hashicorp.com/role: "redis-role"
-        # KV v2 path under 'secret/' mount (Argo CD Vault Plugin-friendly)
         vault.hashicorp.com/agent-inject-secret-password: "secret/data/redis"
         vault.hashicorp.com/agent-inject-template-password: |
           {{- with secret "secret/data/redis" -}}
@@ -399,7 +379,6 @@ spec:
           - labelSelector:
               matchLabels: { app: redis }
             topologyKey: kubernetes.io/hostname
-      tolerations: []
       securityContext:
         fsGroup: 1001
       volumes:
@@ -416,8 +395,8 @@ spec:
             - { containerPort: 6379, name: redis }
           volumeMounts:
             - { name: data,  mountPath: /data }
-            - { name: cfg-ro, mountPath: /config }    # read-only source
-            - { name: cfg-rw, mountPath: /etc/redis } # writable target
+            - { name: cfg-ro, mountPath: /config }
+            - { name: cfg-rw, mountPath: /etc/redis }
           command: ["/bin/sh","-lc"]
           args:
             - |
@@ -425,17 +404,14 @@ spec:
               if ! read -r REDIS_PASSWORD < /vault/secrets/password; then
                 echo "no password at /vault/secrets/password"; exit 1
               fi
-
               cp /config/redis.conf /etc/redis/redis.conf
               echo "requirepass ${REDIS_PASSWORD}"  >> /etc/redis/redis.conf
               echo "masterauth ${REDIS_PASSWORD}"   >> /etc/redis/redis.conf
-
               HN="$(hostname)"
               case "$HN" in
                 *-0) : ;;  # primary
                 *) echo 'replicaof redis-0.redis-headless.redis.svc.cluster.local 6379' >> /etc/redis/redis.conf ;;
               esac
-
               trap 'redis-cli -a "$REDIS_PASSWORD" shutdown nosave || true' TERM INT
               exec redis-server /etc/redis/redis.conf
           readinessProbe:
@@ -451,15 +427,14 @@ spec:
           resources:
             requests: { cpu: "100m", memory: "128Mi" }
             limits:   {           memory: "512Mi" }
-
         - name: sentinel
           image: redis:7.2-alpine
           imagePullPolicy: IfNotPresent
           ports:
             - { containerPort: 26379, name: sentinel }
           volumeMounts:
-            - { name: cfg-ro, mountPath: /config }    # read-only source
-            - { name: cfg-rw, mountPath: /etc/redis } # writable target
+            - { name: cfg-ro, mountPath: /config }
+            - { name: cfg-rw, mountPath: /etc/redis }
           command: ["/bin/sh","-lc"]
           args:
             - |
@@ -499,7 +474,7 @@ spec:
   selector:
     matchLabels: { app: redis }
 ---
-# ===== RedisInsight dashboard (Secret generated from Vault secret/ by bootstrap Job) =====
+# --- RedisInsight -------------------------------------------------------------
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -523,16 +498,11 @@ spec:
           env:
             - name: RI_ACCEPT_TERMS_AND_CONDITIONS
               value: "true"
-
-            # Use the value from secret key RI_APP_ENCRYPTION_KEY,
-            # but expose it to the app as env var RI_ENCRYPTION_KEY
             - name: RI_ENCRYPTION_KEY
               valueFrom:
                 secretKeyRef:
                   name: redisinsight-secrets
                   key: RI_APP_ENCRYPTION_KEY
-
-            # Preconfigure a connection to the in-cluster Redis service
             - name: RI_REDIS_ALIAS0
               value: "cluster-redis"
             - name: RI_REDIS_HOST0
@@ -565,3 +535,36 @@ spec:
   ports:
     - { port: 80, targetPort: 5540, name: http }
   type: ClusterIP
+---
+# --- RDI install via Rancher HelmChart ---------------------------------------
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rdi-values
+  namespace: redis
+data:
+  values.yaml: |
+    api:
+      service:
+        type: ClusterIP
+      auth:
+        enabled: true
+      extraEnvFrom:
+        - secretRef:
+            name: rdi-api-jwt
+---
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: rdi
+  namespace: kube-system
+spec:
+  chart: rdi
+  repo: https://charts.redis.io
+  targetNamespace: redis
+  version: ""   # optionally pin, e.g., "1.6.6"
+  valuesFrom:
+    - configMapKeyRef:
+        name: rdi-values
+        namespace: redis
+        key: values.yaml
