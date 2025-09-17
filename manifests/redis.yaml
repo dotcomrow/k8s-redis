@@ -568,3 +568,101 @@ spec:
         name: rdi-values
         namespace: redis
         key: values.yaml
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oauth2-proxy-redisinsight
+  namespace: redis
+  labels:
+    app: oauth2-proxy
+    component: redisinsight
+  annotations:
+    linkerd.io/inject: disabled
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: oauth2-proxy
+      component: redisinsight
+  template:
+    metadata:
+      labels:
+        app: oauth2-proxy
+        component: redisinsight
+      annotations:
+        linkerd.io/inject: disabled
+    spec:
+      containers:
+        - name: oauth2-proxy
+          image: quay.io/oauth2-proxy/oauth2-proxy:v7.6.0
+          args:
+            - --http-address=0.0.0.0:4180
+            # Point to the RedisInsight service (Service maps 80 -> 5540)
+            - --upstream=http://redisinsight.redis.svc.cluster.local:80
+            - --provider=github
+            - --email-domain=*
+            - --client-id=$(OAUTH2_CLIENT_ID)
+            - --client-secret=$(OAUTH2_CLIENT_SECRET)
+            - --cookie-secret=$(OAUTH2_COOKIE_SECRET)
+            - --redirect-url=https://redisui.app.suncoast.systems/oauth2/callback
+            - --scope=user:email,read:org
+            - --cookie-secure=true
+            # Restrict access to a specific GitHub org/team (adjust to your needs)
+            - --allowed-group=dotcomrow:redis_admin_gui
+          env:
+            - name: OAUTH2_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: redisinsight-oauth2-proxy-creds
+                  key: client-id
+            - name: OAUTH2_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: redisinsight-oauth2-proxy-creds
+                  key: client-secret
+            - name: OAUTH2_COOKIE_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: redisinsight-oauth2-proxy-creds
+                  key: cookie-secret
+          ports:
+            - containerPort: 4180
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: oauth2-proxy-redisinsight
+  namespace: redis
+  labels:
+    app: oauth2-proxy
+    component: redisinsight
+spec:
+  selector:
+    app: oauth2-proxy
+    component: redisinsight
+  ports:
+    - port: 4180
+      targetPort: 4180
+      name: http
+
+---
+# AVP-style placeholders for Vault. Replace paths/keys if you prefer different secrets.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: redisinsight-oauth2-proxy-creds
+  namespace: redis
+type: Opaque
+stringData:
+  client-id: "<path:secret/data/redisinsight-oauth2-client-id#value>"
+  client-secret: "<path:secret/data/redisinsight-oauth2-client-secret#value>"
+  cookie-secret: "<path:secret/data/redisinsight-oauth2-cookie-secret#value>"
