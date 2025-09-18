@@ -544,6 +544,11 @@ metadata:
   namespace: redis
 data:
   values.yaml: |
+    connection:
+      host: "redis-0.redis.svc.cluster.local"   # FQDN of the Redis Enterprise DB for RDI state
+      port: 6379                                  # Example: TLS port or 6379 if non-TLS
+      password: "<path:secret/data/redis#password>"  # Vault placeholder (AVP)
+
     api:
       service:
         type: ClusterIP
