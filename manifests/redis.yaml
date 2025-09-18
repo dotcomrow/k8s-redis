@@ -559,8 +559,7 @@ metadata:
   name: rdi
   namespace: kube-system
 spec:
-  chart: rdi
-  repo: https://charts.redis.io
+  chart: https://redis-enterprise-software-downloads.s3.amazonaws.com/redis-di/rdi-1.14.1.tgz
   targetNamespace: redis
   version: ""   # optionally pin, e.g., "1.6.6"
   valuesFrom:
