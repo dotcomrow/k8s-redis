@@ -9,6 +9,7 @@ metadata:
     linkerd.io/inject: disabled
     field.cattle.io/projectId: local:infrastructure
     vault.hashicorp.com/agent-injection: enabled
+
 ---
 # --- Service Accounts ---------------------------------------------------------
 apiVersion: v1
@@ -22,6 +23,7 @@ kind: ServiceAccount
 metadata:
   name: redis
   namespace: redis
+
 ---
 # --- RBAC: allow reading the Vault root token (in vault ns) -------------------
 apiVersion: rbac.authorization.k8s.io/v1
@@ -48,6 +50,7 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
   name: read-vault-root-token
+
 ---
 # --- RBAC: allow writing Secrets in redis ns ---------------------------------
 apiVersion: rbac.authorization.k8s.io/v1
@@ -73,19 +76,20 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
   name: secret-writer
+
 ---
-# --- ONE merged bootstrap Job: Vault + Redis + RedisInsight + RDI ------------
+# --- ONE merged bootstrap Job: Vault + Redis + RedisInsight (no RDI) ----------
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: vault-redis-rdi-bootstrap
+  name: vault-redis-bootstrap
   namespace: redis
 spec:
   backoffLimit: 0
   template:
     metadata:
       labels:
-        app: vault-redis-rdi-bootstrap
+        app: vault-redis-bootstrap
     spec:
       serviceAccountName: vault-bootstrap
       restartPolicy: Never
@@ -98,23 +102,16 @@ spec:
               value: "http://vault.vault.svc.cluster.local:8200"
             - name: B64_LINE_WRAP
               value: "A"   # openssl base64 -A (no wrap)
-
             # Vault KV v2 paths
             - name: VAULT_REDIS_PATH_DATA
               value: "secret/data/redis"
             - name: VAULT_RI_PATH_DATA
               value: "secret/data/redisinsight"
-            - name: VAULT_RDI_PATH_DATA
-              value: "secret/data/rdi/api"
-
             # K8s Secret names materialized from Vault values
             - name: K8S_SECRET_REDIS_AUTH
               value: "redis-auth"
             - name: K8S_SECRET_RI
               value: "redisinsight-secrets"
-            - name: K8S_SECRET_RDI
-              value: "rdi-api-jwt"
-
             # (Optional) Vault K8s auth policy/role for redis Pods
             - name: VAULT_K8S_ROLE
               value: "redis-role"
@@ -210,34 +207,7 @@ spec:
                 RI_APP_ENCRYPTION_KEY: ${B64_RI}
               EOF
 
-              # --- 3) RDI API jwtKey -> Vault -> K8s Secret rdi-api-jwt --------
-              echo "🧩 Ensuring RDI API jwtKey at $VAULT_RDI_PATH_DATA…"
-              set +e
-              RDI_JWT="$(VAULT_API GET "$VAULT_RDI_PATH_DATA" | jq -er '.data.data.jwtKey' 2>/dev/null)"
-              rc=$?
-              set -e
-              if [ $rc -ne 0 ] || [ -z "${RDI_JWT:-}" ]; then
-                RDI_JWT="$(openssl rand -base64 48 | tr -d '\n=')"
-                RDI_BODY="$(jq -Rn --arg k "$RDI_JWT" '{data:{jwtKey:$k}}')"
-                VAULT_API POST "$VAULT_RDI_PATH_DATA" "$RDI_BODY" >/dev/null
-                echo "✅ Created new RDI jwtKey in Vault."
-              else
-                echo "♻️  Reusing existing RDI jwtKey (len=$(printf '%s' "$RDI_JWT" | wc -c))"
-              fi
-
-              echo "🧾 Applying Secret ${K8S_SECRET_RDI} (redis)…"
-              B64JWT="$(printf '%s' "$RDI_JWT" | openssl base64 -$B64_LINE_WRAP)"
-              cat <<EOF | kubectl apply -n redis -f -
-              apiVersion: v1
-              kind: Secret
-              metadata:
-                name: ${K8S_SECRET_RDI}
-              type: Opaque
-              data:
-                jwtKey: ${B64JWT}
-              EOF
-
-              # --- 4) (Optional) Vault policy/role for redis Pods --------------
+              # --- 3) (Optional) Vault policy/role for redis Pods --------------
               echo "🔎 Checking Vault auth backends…"
               SKIP_K8S_AUTH=0
               if AUTHS_JSON="$(VAULT_API GET sys/auth)"; then
@@ -250,7 +220,7 @@ spec:
                 SKIP_K8S_AUTH=1
               fi
 
-              if [ "$SKIP_K8S_AUTH" -eq 0 ]; then
+              if [ "$SKIP_K8S_AUTH" -eq 0 ] ; then
                 echo "🧩 Ensuring policy ${VAULT_K8S_POLICY} and role ${VAULT_K8S_ROLE}…"
                 printf '%s' "{\"policy\":\"path \\\"secret/data/redis\\\" { capabilities = [\\\"read\\\"] }\npath \\\"secret/metadata/redis\\\" { capabilities = [\\\"read\\\"] }\"}" > /tmp/redis-policy.json
                 VAULT_API PUT "sys/policies/acl/${VAULT_K8S_POLICY}" "$(cat /tmp/redis-policy.json)" >/dev/null
@@ -265,7 +235,8 @@ spec:
                 echo "ℹ️  Skipped policy/role creation."
               fi
 
-              echo "✅ Vault + Redis + RDI bootstrap complete."
+              echo "✅ Vault + Redis + RedisInsight bootstrap complete."
+
 ---
 # --- Redis config -------------------------------------------------------------
 apiVersion: v1
@@ -292,6 +263,7 @@ data:
     sentinel parallel-syncs mymaster 1
     sentinel failover-timeout mymaster 60000
     sentinel resolve-hostnames yes
+
 ---
 # --- Services -----------------------------------------------------------------
 apiVersion: v1
@@ -339,6 +311,7 @@ spec:
     - name: sentinel
       port: 26379
       targetPort: 26379
+
 ---
 # --- Redis StatefulSet + Sentinel --------------------------------------------
 apiVersion: apps/v1
@@ -463,6 +436,7 @@ spec:
       spec:
         accessModes: ["ReadWriteOnce"]
         resources: { requests: { storage: 5Gi } }
+
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget
@@ -473,6 +447,7 @@ spec:
   minAvailable: 2
   selector:
     matchLabels: { app: redis }
+
 ---
 # --- RedisInsight -------------------------------------------------------------
 apiVersion: apps/v1
@@ -524,6 +499,7 @@ spec:
       volumes:
         - name: data
           emptyDir: {}
+
 ---
 apiVersion: v1
 kind: Service
@@ -535,44 +511,9 @@ spec:
   ports:
     - { port: 80, targetPort: 5540, name: http }
   type: ClusterIP
----
-# --- RDI install via Rancher HelmChart ---------------------------------------
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: rdi-values
-  namespace: redis
-data:
-  values.yaml: |
-    connection:
-      host: "redis-0.redis.svc.cluster.local"   # FQDN of the Redis Enterprise DB for RDI state
-      port: 6379                                  # Example: TLS port or 6379 if non-TLS
-      password: "<path:secret/data/redis#password>"  # Vault placeholder (AVP)
 
-    api:
-      service:
-        type: ClusterIP
-      auth:
-        enabled: true
-      extraEnvFrom:
-        - secretRef:
-            name: rdi-api-jwt
 ---
-apiVersion: helm.cattle.io/v1
-kind: HelmChart
-metadata:
-  name: rdi
-  namespace: kube-system
-spec:
-  chart: https://redis-enterprise-software-downloads.s3.amazonaws.com/redis-di/rdi-1.14.1.tgz
-  targetNamespace: redis
-  version: ""   # optionally pin, e.g., "1.6.6"
-  valuesFrom:
-    - configMapKeyRef:
-        name: rdi-values
-        namespace: redis
-        key: values.yaml
----
+# --- OAuth2 Proxy in front of RedisInsight -----------------------------------
 apiVersion: apps/v1
 kind: Deployment
 metadata:
