@@ -595,9 +595,9 @@ metadata:
     app.kubernetes.io/component: redis
     teleport.dev/app: "redisinsight"
   annotations:
-    teleport.dev/name: "redis-gui"
+    teleport.dev/name: "redisui"
     teleport.dev/protocol: "http"
-    teleport.dev/public_addr: "redis-gui.app.suncoast.systems"
+    teleport.dev/public_addr: "redisui.app.suncoast.systems"
     teleport.dev/labels: "environment=production,service=redis"
 
 spec:
