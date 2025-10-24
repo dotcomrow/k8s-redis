@@ -550,7 +550,7 @@ spec:
             - --client-id=$(OAUTH2_CLIENT_ID)
             - --client-secret=$(OAUTH2_CLIENT_SECRET)
             - --cookie-secret=$(OAUTH2_COOKIE_SECRET)
-            - --redirect-url=https://redisui.app.suncoast.systems/oauth2/callback
+            - --redirect-url=https://redisui.teleport.app.suncoast.systems/oauth2/callback
             - --scope=user:email,read:org
             - --cookie-secure=true
             # Restrict access to a specific GitHub org/team (adjust to your needs)
