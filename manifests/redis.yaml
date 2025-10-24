@@ -590,6 +590,16 @@ metadata:
   labels:
     app: oauth2-proxy
     component: redisinsight
+    teleport.dev/enroll: "true"
+    app.kubernetes.io/name: redisinsight
+    app.kubernetes.io/component: redis
+    teleport.dev/app: "redisinsight"
+  annotations:
+    teleport.dev/name: "redis insight gui"
+    teleport.dev/protocol: "http"
+    teleport.dev/public_addr: "redis-insight-gui.app.suncoast.systems"
+    teleport.dev/labels: "environment=production,service=redis"
+
 spec:
   selector:
     app: oauth2-proxy
