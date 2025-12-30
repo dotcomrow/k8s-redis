@@ -397,9 +397,6 @@ spec:
               command: ["/bin/sh","-lc","read -r P </vault/secrets/password && redis-cli -a \"$P\" PING | grep -q PONG"]
             initialDelaySeconds: 15
             periodSeconds: 10
-          resources:
-            requests: { cpu: "100m", memory: "128Mi" }
-            limits:   {           memory: "512Mi" }
         - name: sentinel
           image: redis:7.2-alpine
           imagePullPolicy: IfNotPresent
@@ -428,9 +425,6 @@ spec:
               command: ["/bin/sh","-lc","read -r P </vault/secrets/password && redis-cli -p 26379 PING | grep -q PONG"]
             initialDelaySeconds: 15
             periodSeconds: 10
-          resources:
-            requests: { cpu: "50m", memory: "64Mi" }
-            limits: { memory: "256Mi" }
   volumeClaimTemplates:
     - metadata: { name: data }
       spec:
@@ -493,9 +487,6 @@ spec:
                   key: password
           volumeMounts:
             - { name: data, mountPath: /data }
-          resources:
-            requests: { cpu: "100m", memory: "256Mi" }
-            limits:   { cpu: "500m", memory: "512Mi" }
       volumes:
         - name: data
           emptyDir: {}
@@ -573,13 +564,6 @@ spec:
                   key: cookie-secret
           ports:
             - containerPort: 4180
-          resources:
-            requests:
-              cpu: 100m
-              memory: 64Mi
-            limits:
-              cpu: 500m
-              memory: 256Mi
 
 ---
 apiVersion: v1
