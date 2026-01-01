@@ -322,6 +322,8 @@ spec:
   serviceName: redis-headless
   replicas: 2
   podManagementPolicy: Parallel
+  updateStrategy:
+    type: OnDelete
   selector:
     matchLabels: { app: redis }
   template:
