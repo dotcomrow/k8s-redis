@@ -9,7 +9,6 @@ metadata:
     linkerd.io/inject: disabled
     field.cattle.io/projectId: local:infrastructure
     vault.hashicorp.com/agent-injection: enabled
-
 ---
 # --- Service Accounts ---------------------------------------------------------
 apiVersion: v1
@@ -346,7 +345,7 @@ spec:
             - matchExpressions:
               - key: dedicated
                 operator: In
-                values: ["work-node", "srvr-node"]
+                values: ["work-node", "work-node-gpu", "srvr-node"]
         podAntiAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
           - labelSelector:
