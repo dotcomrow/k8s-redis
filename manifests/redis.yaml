@@ -324,6 +324,7 @@ spec:
   podManagementPolicy: Parallel
   updateStrategy:
     type: OnDelete
+    rollingUpdate: null
   selector:
     matchLabels: { app: redis }
   template:
