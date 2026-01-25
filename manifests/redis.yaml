@@ -582,7 +582,9 @@ metadata:
     teleport.dev/app: "redisinsight"
   annotations:
     teleport.dev/name: "redisui"
+    teleport.dev/description: "RedisInsight UI (OAuth2 proxy)"
     teleport.dev/protocol: "http"
+    teleport.dev/port: "4180"
     teleport.dev/public_addr: "redisui.app.suncoast.systems"
     teleport.dev/labels: "environment=production,service=redis"
 
