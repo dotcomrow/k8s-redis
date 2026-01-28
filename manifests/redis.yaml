@@ -479,6 +479,8 @@ kind: Deployment
 metadata:
   name: redisinsight
   namespace: redis
+  annotations:
+    secret.reloader.stakater.com/reload: "redisinsight-preconfig,redisinsight-secrets"
 spec:
   replicas: 1
   selector: { matchLabels: { app: redisinsight } }
