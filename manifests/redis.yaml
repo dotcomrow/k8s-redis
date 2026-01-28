@@ -83,6 +83,8 @@ kind: Job
 metadata:
   name: vault-redis-bootstrap
   namespace: redis
+  annotations:
+    argocd.argoproj.io/sync-options: Replace=true
 spec:
   backoffLimit: 0
   template:
