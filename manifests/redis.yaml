@@ -179,6 +179,33 @@ spec:
                 password: ${B64PW}
               EOF
 
+              # --- 1b) RedisInsight preconfig (db0-15) -> K8s Secret --------
+              echo "🧩 Building RedisInsight preconfig for 16 logical DBs…"
+              PRECONFIG_JSON="$(jq -n \
+                --arg host "redis.redis.svc.cluster.local" \
+                --arg user "default" \
+                --arg pass "$REDIS_PW" \
+                '[range(0;16) | {
+                  id: ("redis-db-" + (. | tostring)),
+                  name: ("redis-db-" + (. | tostring)),
+                  host: $host,
+                  port: 6379,
+                  db: .,
+                  username: $user,
+                  password: $pass,
+                  connectionType: "STANDALONE"
+                }]')"
+              PRECONFIG_B64="$(printf '%s' "$PRECONFIG_JSON" | openssl base64 -$B64_LINE_WRAP)"
+              cat <<EOF | kubectl apply -n redis -f -
+              apiVersion: v1
+              kind: Secret
+              metadata:
+                name: redisinsight-preconfig
+              type: Opaque
+              data:
+                preconfig.json: ${PRECONFIG_B64}
+              EOF
+
               # --- 2) RedisInsight encryption key -> Vault -> K8s Secret -------
               echo "🧩 Ensuring RedisInsight key at $VAULT_RI_PATH_DATA…"
               set +e
@@ -248,6 +275,7 @@ data:
     port 6379
     bind 0.0.0.0
     protected-mode no
+    databases 16
     appendonly yes
     save ""
     tcp-keepalive 300
@@ -474,24 +502,17 @@ spec:
                 secretKeyRef:
                   name: redisinsight-secrets
                   key: RI_APP_ENCRYPTION_KEY
-            - name: RI_REDIS_ALIAS0
-              value: "cluster-redis"
-            - name: RI_REDIS_HOST0
-              value: "redis.redis.svc.cluster.local"
-            - name: RI_REDIS_PORT0
-              value: "6379"
-            - name: RI_REDIS_USERNAME0
-              value: "default"
-            - name: RI_REDIS_PASSWORD0
-              valueFrom:
-                secretKeyRef:
-                  name: redis-auth
-                  key: password
+            - name: RI_PRE_SETUP_DATABASES_PATH
+              value: "/mnt/redisinsight/preconfig.json"
           volumeMounts:
             - { name: data, mountPath: /data }
+            - { name: preconfig, mountPath: /mnt/redisinsight, readOnly: true }
       volumes:
         - name: data
           emptyDir: {}
+        - name: preconfig
+          secret:
+            secretName: redisinsight-preconfig
 
 ---
 apiVersion: v1
