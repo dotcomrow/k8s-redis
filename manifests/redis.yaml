@@ -84,7 +84,7 @@ metadata:
   name: vault-redis-bootstrap
   namespace: redis
   annotations:
-    argocd.argoproj.io/sync-options: Replace=true
+    argocd.argoproj.io/sync-options: Replace=true,Force=true
 spec:
   backoffLimit: 0
   template:
