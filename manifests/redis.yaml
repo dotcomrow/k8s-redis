@@ -300,10 +300,14 @@ kind: Service
 metadata:
   name: redis
   namespace: redis
-  labels: { app: redis }
+  labels:
+    app: redis
+    app.kubernetes.io/name: redis
 spec:
   type: ClusterIP
-  selector: { app: redis }
+  selector:
+    app: redis
+    app.kubernetes.io/name: redis
   ports:
     - name: redis
       port: 6379
@@ -314,10 +318,14 @@ kind: Service
 metadata:
   name: redis-sentinel
   namespace: redis
-  labels: { app: redis }
+  labels:
+    app: redis
+    app.kubernetes.io/name: redis
 spec:
   type: ClusterIP
-  selector: { app: redis }
+  selector:
+    app: redis
+    app.kubernetes.io/name: redis
   ports:
     - name: sentinel
       port: 26379
@@ -328,11 +336,15 @@ kind: Service
 metadata:
   name: redis-headless
   namespace: redis
-  labels: { app: redis }
+  labels:
+    app: redis
+    app.kubernetes.io/name: redis
 spec:
   clusterIP: None
   publishNotReadyAddresses: true
-  selector: { app: redis }
+  selector:
+    app: redis
+    app.kubernetes.io/name: redis
   ports:
     - name: redis
       port: 6379
@@ -359,7 +371,9 @@ spec:
     matchLabels: { app: redis }
   template:
     metadata:
-      labels: { app: redis }
+      labels:
+        app: redis
+        app.kubernetes.io/name: redis
       annotations:
         vault.hashicorp.com/agent-inject: "true"
         vault.hashicorp.com/role: "redis-role"
