@@ -583,7 +583,7 @@ spec:
           args:
             - --http-address=0.0.0.0:4180
             # Point to the RedisInsight service (Service maps 80 -> 5540)
-            - --upstream=http://redisinsight.redis.svc.cluster.local:80
+            - --upstream=http://redisinsight.redis.svc:80
             - --provider=github
             - --email-domain=*
             - --client-id=$(OAUTH2_CLIENT_ID)
@@ -697,8 +697,8 @@ spec:
                 - -lc
                 - |
                   set -eu
-                  code_internal=$(curl -sS -o /dev/null -w "%{http_code}" http://redisinsight.redis.svc.cluster.local:80/ || true)
-                  code_public=$(curl -sS -o /dev/null -w "%{http_code}" -H "Host: redisui.teleport.app.suncoast.systems" http://apisix-gateway.apisix.svc.cluster.local/ || true)
+                  code_internal=$(curl -sS -o /dev/null -w "%{http_code}" http://redisinsight.redis.svc:80/ || true)
+                  code_public=$(curl -sS -o /dev/null -w "%{http_code}" -H "Host: redisui.teleport.app.suncoast.systems" http://apisix-gateway.apisix.svc/ || true)
                   if [ "${code_internal}" = "000" ] || [ "${code_internal}" -ge 500 ]; then
                     echo "redisinsight service unhealthy: ${code_internal}"
                     exit 1
