@@ -463,18 +463,6 @@ spec:
         accessModes: ["ReadWriteOnce"]
         resources: { requests: { storage: 5Gi } }
 
----
-apiVersion: policy/v1
-kind: PodDisruptionBudget
-metadata:
-  name: redis-pdb
-  namespace: redis
-spec:
-  minAvailable: 2
-  selector:
-    matchLabels: { app: redis }
-
----
 # --- RedisInsight -------------------------------------------------------------
 apiVersion: apps/v1
 kind: Deployment
