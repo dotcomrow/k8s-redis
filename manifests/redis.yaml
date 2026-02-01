@@ -477,6 +477,7 @@ spec:
         accessModes: ["ReadWriteOnce"]
         resources: { requests: { storage: 5Gi } }
 
+---
 # --- RedisInsight -------------------------------------------------------------
 apiVersion: apps/v1
 kind: Deployment
