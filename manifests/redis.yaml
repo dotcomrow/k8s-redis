@@ -481,6 +481,9 @@ kind: Deployment
 metadata:
   name: redisinsight
   namespace: redis
+  labels:
+    app: redisinsight
+    platform.suncoast.systems/vpa-exclude: "true"
   annotations:
     secret.reloader.stakater.com/reload: "redisinsight-preconfig,redisinsight-secrets"
 spec:
@@ -488,7 +491,9 @@ spec:
   selector: { matchLabels: { app: redisinsight } }
   template:
     metadata:
-      labels: { app: redisinsight }
+      labels:
+        app: redisinsight
+        platform.suncoast.systems/vpa-exclude: "true"
       annotations:
         linkerd.io/inject: disabled
     spec:
@@ -547,6 +552,7 @@ metadata:
   labels:
     app: oauth2-proxy
     component: redisinsight
+    platform.suncoast.systems/vpa-exclude: "true"
   annotations:
     linkerd.io/inject: disabled
 spec:
@@ -560,6 +566,7 @@ spec:
       labels:
         app: oauth2-proxy
         component: redisinsight
+        platform.suncoast.systems/vpa-exclude: "true"
       annotations:
         linkerd.io/inject: disabled
     spec:
@@ -635,6 +642,71 @@ spec:
     - port: 4180
       targetPort: 4180
       name: http
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: redisinsight-pdb
+  namespace: redis
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: redisinsight
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: oauth2-proxy-redisinsight-pdb
+  namespace: redis
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: oauth2-proxy
+      component: redisinsight
+
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: redisinsight-ui-canary
+  namespace: redis
+  labels:
+    app: redisinsight
+spec:
+  schedule: "*/5 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            app: redisinsight
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: canary
+              image: curlimages/curl:8.5.0
+              args:
+                - /bin/sh
+                - -lc
+                - |
+                  set -eu
+                  code_internal=$(curl -sS -o /dev/null -w "%{http_code}" http://redisinsight.redis.svc.cluster.local:80/ || true)
+                  code_public=$(curl -sS -o /dev/null -w "%{http_code}" -H "Host: redisui.teleport.app.suncoast.systems" http://apisix-gateway.apisix.svc.cluster.local/ || true)
+                  if [ "${code_internal}" = "000" ] || [ "${code_internal}" -ge 500 ]; then
+                    echo "redisinsight service unhealthy: ${code_internal}"
+                    exit 1
+                  fi
+                  if [ "${code_public}" = "000" ] || [ "${code_public}" -ge 500 ]; then
+                    echo "redisui route unhealthy: ${code_public}"
+                    exit 1
+                  fi
 
 ---
 # AVP-style placeholders for Vault. Replace paths/keys if you prefer different secrets.
