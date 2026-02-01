@@ -483,6 +483,7 @@ metadata:
   namespace: redis
   labels:
     app: redisinsight
+    component: ui
     platform.suncoast.systems/vpa-exclude: "true"
   annotations:
     secret.reloader.stakater.com/reload: "redisinsight-preconfig,redisinsight-secrets"
@@ -493,6 +494,7 @@ spec:
     metadata:
       labels:
         app: redisinsight
+        component: ui
         platform.suncoast.systems/vpa-exclude: "true"
       annotations:
         linkerd.io/inject: disabled
@@ -536,8 +538,11 @@ kind: Service
 metadata:
   name: redisinsight
   namespace: redis
+  labels:
+    app: redisinsight
+    component: ui
 spec:
-  selector: { app: redisinsight }
+  selector: { app: redisinsight, component: ui }
   ports:
     - { port: 80, targetPort: 5540, name: http }
   type: ClusterIP
@@ -583,7 +588,7 @@ spec:
           args:
             - --http-address=0.0.0.0:4180
             # Point to the RedisInsight service (Service maps 80 -> 5540)
-            - --upstream=http://redisinsight.redis.svc:80
+            - --upstream=http://redisinsight:80
             - --provider=github
             - --email-domain=*
             - --client-id=$(OAUTH2_CLIENT_ID)
@@ -654,6 +659,7 @@ spec:
   selector:
     matchLabels:
       app: redisinsight
+      component: ui
 
 ---
 apiVersion: policy/v1
@@ -676,6 +682,7 @@ metadata:
   namespace: redis
   labels:
     app: redisinsight
+    component: canary
 spec:
   schedule: "*/5 * * * *"
   concurrencyPolicy: Forbid
@@ -687,6 +694,9 @@ spec:
         metadata:
           labels:
             app: redisinsight
+            component: canary
+          annotations:
+            linkerd.io/inject: disabled
         spec:
           restartPolicy: Never
           containers:
@@ -697,8 +707,8 @@ spec:
                 - -lc
                 - |
                   set -eu
-                  code_internal=$(curl -sS -o /dev/null -w "%{http_code}" http://redisinsight.redis.svc:80/ || true)
-                  code_public=$(curl -sS -o /dev/null -w "%{http_code}" -H "Host: redisui.teleport.app.suncoast.systems" http://apisix-gateway.apisix.svc/ || true)
+                  code_internal=$(curl -sS -o /dev/null -w "%{http_code}" http://redisinsight:80/ || true)
+                  code_public=$(curl -sS -o /dev/null -w "%{http_code}" -H "Host: redisui.teleport.app.suncoast.systems" http://apisix-gateway.apisix/ || true)
                   if [ "${code_internal}" = "000" ] || [ "${code_internal}" -ge 500 ]; then
                     echo "redisinsight service unhealthy: ${code_internal}"
                     exit 1
