@@ -161,7 +161,8 @@ spec:
               rc=$?
               set -e
               if [ $rc -ne 0 ] || [ -z "${REDIS_PW:-}" ]; then
-                REDIS_PW="$(openssl rand -base64 36)"
+                # URL-safe (base64url) so it can be embedded in redis://... URLs without escaping.
+                REDIS_PW="$(openssl rand -base64 36 | tr '+/' '-_')"
                 BODY="$(jq -Rn --arg p "$REDIS_PW" '{data:{password:$p}}')"
                 VAULT_API POST "$VAULT_REDIS_PATH_DATA" "$BODY" >/dev/null
                 echo "✅ Created new Redis password in Vault."
