@@ -640,7 +640,7 @@ metadata:
     teleport.dev/description: "RedisInsight UI (OAuth2 proxy)"
     teleport.dev/protocol: "http"
     teleport.dev/port: "4180"
-    teleport.dev/public_addr: "redisui.app.suncoast.systems"
+    teleport.dev/public_addr: "redisui.teleport.app.suncoast.systems"
     teleport.dev/labels: "environment=production,service=redis"
 
 spec:
@@ -713,11 +713,11 @@ spec:
                   set -eu
                   code_internal=$(curl -sS -o /dev/null -w "%{http_code}" http://redisinsight:80/ || true)
                   code_public=$(curl -sS -o /dev/null -w "%{http_code}" -H "Host: redisui.teleport.app.suncoast.systems" http://apisix-gateway.apisix/ || true)
-                  if [ "${code_internal}" = "000" ] || [ "${code_internal}" -ge 500 ]; then
+                  if [ "${code_internal}" = "000" ] || [ "${code_internal}" -lt 200 ] || [ "${code_internal}" -ge 400 ]; then
                     echo "redisinsight service unhealthy: ${code_internal}"
                     exit 1
                   fi
-                  if [ "${code_public}" = "000" ] || [ "${code_public}" -ge 500 ]; then
+                  if [ "${code_public}" = "000" ] || [ "${code_public}" -lt 200 ] || [ "${code_public}" -ge 400 ]; then
                     echo "redisui route unhealthy: ${code_public}"
                     exit 1
                   fi
