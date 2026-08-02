@@ -621,14 +621,24 @@ spec:
             - --http-address=0.0.0.0:4180
             # Point to the RedisInsight service (Service maps 80 -> 5540)
             - --upstream=http://redisinsight:80
+            - --reverse-proxy=true
+            - --real-client-ip-header=X-Forwarded-For
+            - --pass-host-header=true
+            - --proxy-websockets=true
             - --provider=github
             - --email-domain=*
             - --client-id=$(OAUTH2_CLIENT_ID)
             - --client-secret=$(OAUTH2_CLIENT_SECRET)
             - --cookie-secret=$(OAUTH2_COOKIE_SECRET)
+            - --cookie-name=_oauth2_proxy_redisinsight
+            - --cookie-domain=redisui.teleport.app.suncoast.systems
             - --redirect-url=https://redisui.teleport.app.suncoast.systems/oauth2/callback
+            - --whitelist-domain=redisui.teleport.app.suncoast.systems
             - --scope=user:email,read:org
             - --cookie-secure=true
+            - --cookie-samesite=lax
+            - --api-route=^/api/.*
+            - --api-route=^/socket.io/.*
             # Restrict access to a specific GitHub org/team (adjust to your needs)
             - --allowed-group=dotcomrow:redis_admin_gui
           env:
@@ -742,6 +752,9 @@ spec:
                   code_internal=$(curl -sS -o /dev/null -w "%{http_code}" http://redisinsight:80/ || true)
                   code_health=$(curl -sS -o /dev/null -w "%{http_code}" http://redisinsight:80/api/health || true)
                   html="$(curl -sS http://redisinsight:80/ || true)"
+                  info="$(curl -sS http://redisinsight:80/api/info || true)"
+                  settings="$(curl -sS http://redisinsight:80/api/settings || true)"
+                  features="$(curl -sS http://redisinsight:80/api/features || true)"
                   databases="$(curl -sS http://redisinsight:80/api/databases || true)"
                   code_public=$(curl -sS -o /dev/null -w "%{http_code}" -H "Host: redisui.teleport.app.suncoast.systems" http://apisix-gateway.apisix/ || true)
                   if [ "${code_internal}" = "000" ] || [ "${code_internal}" -lt 200 ] || [ "${code_internal}" -ge 400 ]; then
@@ -754,6 +767,18 @@ spec:
                   fi
                   if [ "${code_health}" = "000" ] || [ "${code_health}" -lt 200 ] || [ "${code_health}" -ge 400 ]; then
                     echo "redisinsight api unhealthy: ${code_health}"
+                    exit 1
+                  fi
+                  if ! printf '%s' "${info}" | grep -q '"appVersion":"3.8.0"'; then
+                    echo "redisinsight api is not serving RedisInsight 3.8.0"
+                    exit 1
+                  fi
+                  if ! printf '%s' "${settings}" | grep -q '"agreements"'; then
+                    echo "redisinsight settings bootstrap endpoint is unhealthy"
+                    exit 1
+                  fi
+                  if ! printf '%s' "${features}" | grep -q '"features"'; then
+                    echo "redisinsight features bootstrap endpoint is unhealthy"
                     exit 1
                   fi
                   if ! printf '%s' "${databases}" | grep -q '"host":"redis-primary.redis.svc.cluster.local"'; then
