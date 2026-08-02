@@ -540,8 +540,8 @@ spec:
       securityContext: { fsGroup: 1000 }
       containers:
         - name: redisinsight
-          image: redis/redisinsight:latest
-          imagePullPolicy: IfNotPresent
+          image: redis/redisinsight:3.8.0
+          imagePullPolicy: Always
           ports: [{ containerPort: 5540, name: http }]
           env:
             - name: RI_ACCEPT_TERMS_AND_CONDITIONS
@@ -741,10 +741,15 @@ spec:
                   set -eu
                   code_internal=$(curl -sS -o /dev/null -w "%{http_code}" http://redisinsight:80/ || true)
                   code_health=$(curl -sS -o /dev/null -w "%{http_code}" http://redisinsight:80/api/health || true)
+                  html="$(curl -sS http://redisinsight:80/ || true)"
                   databases="$(curl -sS http://redisinsight:80/api/databases || true)"
                   code_public=$(curl -sS -o /dev/null -w "%{http_code}" -H "Host: redisui.teleport.app.suncoast.systems" http://apisix-gateway.apisix/ || true)
                   if [ "${code_internal}" = "000" ] || [ "${code_internal}" -lt 200 ] || [ "${code_internal}" -ge 400 ]; then
                     echo "redisinsight service unhealthy: ${code_internal}"
+                    exit 1
+                  fi
+                  if ! printf '%s' "${html}" | grep -Eq '<script[^>]*type="module"[^>]*src="/assets/index-[^"]+\.js"'; then
+                    echo "redisinsight html is missing the executable frontend module script"
                     exit 1
                   fi
                   if [ "${code_health}" = "000" ] || [ "${code_health}" -lt 200 ] || [ "${code_health}" -ge 400 ]; then
