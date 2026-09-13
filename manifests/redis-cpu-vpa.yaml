@@ -1,0 +1,38 @@
+# CPU-only manual VPA for Redis.
+# Redis keeps explicit memory/limit guardrails while CPU requests can learn down.
+---
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: redis-cpu
+  namespace: redis
+  annotations:
+    argocd.argoproj.io/sync-wave: "51"
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: StatefulSet
+    name: redis
+  updatePolicy:
+    updateMode: "InPlaceOrRecreate"
+    minReplicas: 1
+  resourcePolicy:
+    containerPolicies:
+      - containerName: linkerd-proxy
+        mode: "Off"
+      - containerName: vault-agent
+        mode: "Off"
+      - containerName: redis
+        controlledResources: ["cpu"]
+        controlledValues: "RequestsOnly"
+        minAllowed:
+          cpu: "50m"
+        maxAllowed:
+          cpu: "1"
+      - containerName: sentinel
+        controlledResources: ["cpu"]
+        controlledValues: "RequestsOnly"
+        minAllowed:
+          cpu: "25m"
+        maxAllowed:
+          cpu: "250m"
